@@ -6,6 +6,7 @@ import {
   PopoverTrigger,
   PopoverContent,
 } from "~/components/primitives/Popover";
+import useConsumeQueryParam from "~/hooks/useConsumeQueryParam";
 import useStores from "~/hooks/useStores";
 import lazyWithRetry from "~/utils/lazyWithRetry";
 
@@ -18,7 +19,8 @@ type Props = {
 const NotificationsPopover: React.FC = ({ children }: Props) => {
   const { t } = useTranslation();
   const { notifications } = useStores();
-  const [open, setOpen] = useState(false);
+  const shouldOpen = useConsumeQueryParam("notifications") === "true";
+  const [open, setOpen] = useState(shouldOpen);
   const scrollableRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {

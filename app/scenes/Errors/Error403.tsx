@@ -1,6 +1,6 @@
 import * as React from "react";
 import { useTranslation } from "react-i18next";
-import { useHistory } from "react-router-dom";
+import { useLocation } from "react-router-dom";
 import { toast } from "sonner";
 import Button from "~/components/Button";
 import Empty from "~/components/Empty";
@@ -9,6 +9,7 @@ import Scene from "~/components/Scene";
 import { navigateToHome } from "~/actions/definitions/navigation";
 import { HStack } from "~/components/primitives/HStack";
 import { VStack } from "~/components/primitives/VStack";
+import Loading from "~/scenes/Document/components/Loading";
 import { client } from "~/utils/ApiClient";
 
 type Props = {
@@ -18,9 +19,10 @@ type Props = {
 
 const Error403 = ({ documentId }: Props) => {
   const { t } = useTranslation();
-  const history = useHistory();
+  const location = useLocation<{ title?: string }>();
   const [requesting, setRequesting] = React.useState(false);
   const [requested, setRequested] = React.useState(false);
+  const [loading, setLoading] = React.useState(!!documentId);
 
   React.useEffect(() => {
     if (!documentId) {
@@ -35,6 +37,8 @@ const Error403 = ({ documentId }: Props) => {
         setRequested(request?.data?.status === "pending");
       } catch {
         // No pending request or error — leave as not requested
+      } finally {
+        setLoading(false);
       }
     };
 
@@ -51,12 +55,16 @@ const Error403 = ({ documentId }: Props) => {
       await client.post("/accessRequests.create", { documentId });
       setRequested(true);
       toast.success(t("Access request sent"));
-    } catch {
-      toast.error(t("Failed to send access request"));
+    } catch (err) {
+      toast.error(err.message);
     } finally {
       setRequesting(false);
     }
   }, [documentId, t, requested, requesting]);
+
+  if (loading) {
+    return <Loading location={location} />;
+  }
 
   return (
     <Scene title={t("No access to this doc")}>
@@ -71,9 +79,8 @@ const Error403 = ({ documentId }: Props) => {
         ) : (
           <Empty size="large">
             {t(
-              "It doesn't look like you have permission to access this document."
-            )}{" "}
-            {t("You can request access from a document manager.")}
+              "It doesn't look like you have permission to access this document. You can request access."
+            )}
           </Empty>
         )}
         <HStack gap={8}>
@@ -84,7 +91,7 @@ const Error403 = ({ documentId }: Props) => {
               neutral={requesting || requested}
             >
               {requested
-                ? t("Request sent")
+                ? t("Access requested")
                 : requesting
                   ? t("Requesting…")
                   : t("Request access")}
@@ -92,9 +99,6 @@ const Error403 = ({ documentId }: Props) => {
           )}
           <Button action={navigateToHome} hideIcon neutral={!!documentId}>
             {t("Home")}
-          </Button>
-          <Button onClick={history.goBack} neutral>
-            {t("Go back")}
           </Button>
         </HStack>
       </VStack>

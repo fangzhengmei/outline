@@ -68,7 +68,7 @@ Open the document to share it with them: ${teamUrl}${document.path}
 
   protected render(props: Props) {
     const { document, actor, teamUrl } = props;
-    const documentUrl = `${teamUrl}${document.path}?ref=notification-email`;
+    const documentUrl = `${teamUrl}${document.path}?ref=notification-email&notifications=true`;
 
     return (
       <EmailTemplate

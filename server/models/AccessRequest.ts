@@ -141,7 +141,7 @@ class AccessRequest extends IdModel<
    *
    * @returns the pending request or null.
    */
-  public static async pendingRequest({
+  public static async findPendingForUser({
     documentId,
     userId,
   }: {

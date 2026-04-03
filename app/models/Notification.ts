@@ -211,6 +211,12 @@ class Notification extends Model {
       case NotificationEventType.AddUserToCollection:
         return t("invited you to");
       case NotificationEventType.RequestDocumentAccess:
+        if (this.accessRequestStatus === "approved") {
+          return t("was granted access to");
+        }
+        if (this.accessRequestStatus === "dismissed") {
+          return t("requested access to");
+        }
         return t("is requesting access to");
       default:
         return this.event;

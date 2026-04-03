@@ -5,20 +5,12 @@ import { transaction } from "@server/middlewares/transaction";
 import validate from "@server/middlewares/validate";
 import { Document, AccessRequest, UserMembership } from "@server/models";
 import { AccessRequestStatus } from "@server/models/AccessRequest";
-import { authorize } from "@server/policies";
+import { authorize, can } from "@server/policies";
 import { presentAccessRequest, presentPolicies } from "@server/presenters";
 import type { APIContext } from "@server/types";
 import { RateLimiterStrategy } from "@server/utils/RateLimiter";
 import * as T from "./schema";
-import {
-  DocumentPermissionPriority,
-  getDocumentPermission,
-} from "@server/utils/permissions";
-import {
-  AuthorizationError,
-  InvalidRequestError,
-  NotFoundError,
-} from "@server/errors";
+import { InvalidRequestError, NotFoundError } from "@server/errors";
 
 const router = new Router();
 
@@ -38,7 +30,10 @@ router.post(
       transaction,
       rejectOnEmpty: true,
     });
-    authorize(user, "read", document);
+
+    if (can(user, "read", document)) {
+      throw InvalidRequestError("User already has document access");
+    }
 
     const accessRequest = await AccessRequest.createWithCtx(ctx, {
       documentId: document.id,
@@ -62,31 +57,30 @@ router.post(
   async (ctx: APIContext<T.AccessRequestsInfoReq>) => {
     const { user } = ctx.state.auth;
     const { id, documentId } = ctx.input.body;
-
-    let accessReq: AccessRequest | null;
+    let accessRequest: AccessRequest | null;
 
     if (id) {
-      accessReq = await AccessRequest.findByPk(id);
+      accessRequest = await AccessRequest.findByPk(id);
     } else {
       const document = await Document.findByPk(documentId!, {
         userId: user.id,
       });
-      accessReq = document
-        ? await AccessRequest.pendingRequest({
+      accessRequest = document
+        ? await AccessRequest.findPendingForUser({
             documentId: document.id,
             userId: user.id,
           })
         : null;
     }
 
-    if (!accessReq) {
+    if (!accessRequest) {
       throw NotFoundError("Access request not found");
     }
-    authorize(user, "read", accessReq);
+    authorize(user, "read", accessRequest);
 
     ctx.body = {
-      data: presentAccessRequest(accessReq),
-      policies: presentPolicies(user, [accessReq]),
+      data: presentAccessRequest(accessRequest),
+      policies: presentPolicies(user, [accessRequest]),
     };
   }
 );
@@ -118,18 +112,6 @@ router.post(
       transaction,
     });
     authorize(user, "share", document);
-
-    const adminPermission = await getDocumentPermission({
-      userId: user.id,
-      documentId: document.id,
-    });
-    if (
-      !adminPermission ||
-      DocumentPermissionPriority[permission] >
-        DocumentPermissionPriority[adminPermission]
-    ) {
-      throw AuthorizationError();
-    }
 
     const membership = await UserMembership.findOne({
       where: {

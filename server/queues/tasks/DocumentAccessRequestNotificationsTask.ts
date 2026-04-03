@@ -35,7 +35,7 @@ export default class DocumentAccessRequestNotificationsTask extends BaseTask<Acc
     }
 
     // users can only have one pending access request per document
-    const pendingRequest = await AccessRequest.pendingRequest({
+    const pendingRequest = await AccessRequest.findPendingForUser({
       documentId: document.id,
       userId: event.actorId,
     });

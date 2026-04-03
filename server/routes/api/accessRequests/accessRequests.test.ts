@@ -3,6 +3,7 @@ import { AccessRequest, UserMembership } from "@server/models";
 import { AccessRequestStatus } from "@server/models/AccessRequest";
 import {
   buildAdmin,
+  buildCollection,
   buildDocument,
   buildTeam,
   buildUser,
@@ -51,9 +52,15 @@ describe("#accessRequests.create", () => {
     const team = await buildTeam();
     const owner = await buildUser({ teamId: team.id });
     const requester = await buildUser({ teamId: team.id });
+    const collection = await buildCollection({
+      teamId: team.id,
+      userId: owner.id,
+      permission: null,
+    });
     const document = await buildDocument({
       teamId: team.id,
       createdById: owner.id,
+      collectionId: collection.id,
     });
 
     const res = await server.post("/api/accessRequests.create", {
@@ -69,13 +76,38 @@ describe("#accessRequests.create", () => {
     expect(body.data.userId).toEqual(requester.id);
   });
 
-  it("should work with document urlId", async () => {
+  it("should reject if user already has access", async () => {
     const team = await buildTeam();
     const owner = await buildUser({ teamId: team.id });
     const requester = await buildUser({ teamId: team.id });
     const document = await buildDocument({
       teamId: team.id,
       createdById: owner.id,
+    });
+
+    const res = await server.post("/api/accessRequests.create", {
+      body: {
+        token: requester.getJwtToken(),
+        documentId: document.id,
+      },
+    });
+
+    expect(res.status).toEqual(400);
+  });
+
+  it("should work with document urlId", async () => {
+    const team = await buildTeam();
+    const owner = await buildUser({ teamId: team.id });
+    const requester = await buildUser({ teamId: team.id });
+    const collection = await buildCollection({
+      teamId: team.id,
+      userId: owner.id,
+      permission: null,
+    });
+    const document = await buildDocument({
+      teamId: team.id,
+      createdById: owner.id,
+      collectionId: collection.id,
     });
 
     const res = await server.post("/api/accessRequests.create", {
@@ -91,9 +123,15 @@ describe("#accessRequests.create", () => {
     const team = await buildTeam();
     const requester = await buildUser({ teamId: team.id });
     const admin = await buildAdmin({ teamId: team.id });
+    const collection = await buildCollection({
+      teamId: team.id,
+      userId: admin.id,
+      permission: null,
+    });
     const document = await buildDocument({
       createdById: admin.id,
       teamId: team.id,
+      collectionId: collection.id,
     });
 
     // Create first access request
@@ -129,9 +167,15 @@ describe("#accessRequests.create", () => {
     const team = await buildTeam();
     const requester = await buildUser({ teamId: team.id });
     const admin = await buildAdmin({ teamId: team.id });
+    const collection = await buildCollection({
+      teamId: team.id,
+      userId: admin.id,
+      permission: null,
+    });
     const document = await buildDocument({
       createdById: admin.id,
       teamId: team.id,
+      collectionId: collection.id,
     });
 
     // Create and dismiss first request
