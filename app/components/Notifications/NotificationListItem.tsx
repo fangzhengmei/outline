@@ -12,11 +12,10 @@ import useStores from "~/hooks/useStores";
 import { Avatar, AvatarSize, AvatarVariant } from "../Avatar";
 import Button from "../Button";
 import Flex from "../Flex";
-import InputMemberPermissionSelect from "../InputMemberPermissionSelect";
 import Text from "../Text";
 import Time from "../Time";
 import { UnreadBadge } from "../UnreadBadge";
-import type { Permission } from "~/types";
+import { SplitButton } from "../primitives/SplitButton";
 import lazyWithRetry from "~/utils/lazyWithRetry";
 import { ContextMenu } from "../Menu/ContextMenu";
 import { createActionWithChildren } from "~/actions";
@@ -50,19 +49,22 @@ function NotificationListItem({ notification, onNavigate }: Props) {
     notification.event === NotificationEventType.RequestDocumentAccess &&
     notification.accessRequestStatus === "pending";
 
-  const permissions: Permission[] = React.useMemo(
+  const permissionOptions = React.useMemo(
     () => [
       {
         label: t("View only"),
         value: DocumentPermission.Read,
+        description: t("Can view the document"),
       },
       {
         label: t("Can edit"),
         value: DocumentPermission.ReadWrite,
+        description: t("Can view and edit the document"),
       },
       {
         label: t("Manage"),
         value: DocumentPermission.Admin,
+        description: t("Full access including sharing"),
       },
     ],
     [t]
@@ -176,28 +178,21 @@ function NotificationListItem({ notification, onNavigate }: Props) {
             )}
             {isAccessRequestPending && (
               <ActionButtons gap={8} align="center">
-                <PermissionSelect>
-                  <InputMemberPermissionSelect
-                    permissions={permissions}
-                    value={selectedPermission}
-                    onChange={(permission) =>
-                      setSelectedPermission(permission as DocumentPermission)
-                    }
-                    disabled={processing}
-                  />
-                </PermissionSelect>
-                <Button
+                <SplitButton
+                  options={permissionOptions}
+                  selectedValue={selectedPermission}
+                  onSelect={(value) =>
+                    setSelectedPermission(value as DocumentPermission)
+                  }
                   onClick={handleApprove}
                   disabled={processing}
-                  size="small"
                 >
                   {t("Approve")}
-                </Button>
+                </SplitButton>
                 <Button
                   onClick={handleDismiss}
                   disabled={processing}
                   neutral
-                  size="small"
                 >
                   {t("Dismiss")}
                 </Button>
@@ -248,10 +243,6 @@ const Container = styled(Flex)<{ $unread: boolean }>`
 const ActionButtons = styled(Flex)`
   margin-top: 8px;
   flex-wrap: wrap;
-`;
-
-const PermissionSelect = styled.div`
-  min-width: 140px;
 `;
 
 export default observer(NotificationListItem);
