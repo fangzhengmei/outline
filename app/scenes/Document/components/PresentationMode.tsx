@@ -331,7 +331,13 @@ function PresentationMode({ title, icon, iconColor, data, onClose }: Props) {
           </Tooltip>
         </RightButtons>
       </TopBar>
-      <SlideArea onClick={goNext}>
+      <SlideArea
+        onClick={(event: React.MouseEvent) => {
+          if (!(event.target as HTMLElement).closest("a")) {
+            goNext();
+          }
+        }}
+      >
         <SlideContent ref={slideContentRef}>
           {slide.type === "title" ? (
             <TitleSlide>
@@ -395,6 +401,10 @@ const Container = styled.div<{ $background: string; $idle: boolean }>`
   * {
     cursor: inherit;
   }
+
+  a[href] {
+    cursor: ${(props) => (props.$idle ? "none" : "pointer")};
+  }
 `;
 
 const SlideArea = styled.div`
@@ -414,6 +424,12 @@ const SlideContent = styled.div`
   .ProseMirror {
     padding: 0;
     font-size: 1.4em;
+  }
+
+  .image-wrapper,
+  .image-wrapper img,
+  .mermaid-diagram-wrapper {
+    pointer-events: none !important;
   }
 
   h1 {

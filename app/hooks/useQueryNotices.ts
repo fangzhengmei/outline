@@ -29,11 +29,15 @@ export default function useQueryNotices() {
         message = t("Subscription successful");
         break;
       }
+      case QueryNotices.Unsubscribed: {
+        message = t("Unsubscribed");
+        break;
+      }
       default:
     }
 
     if (message) {
-      toast.success(message);
+      setTimeout(() => toast.success(message), 0);
     }
   }, [t, notice]);
 }
