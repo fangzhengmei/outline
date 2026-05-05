@@ -124,7 +124,36 @@ const provider = new HocuspocusProvider({
 | `close` | 处理连接关闭，检查错误码（如编辑器版本不兼容） | L182-195 |
 | `status` | 更新 UI 状态（connecting/connected/disconnected） | L216-220 |
 | `awarenessChange` | 更新协作者感知（光标、滚动位置） | L142-159 |
-| `authenticationFailed` | 令牌刷新与重连逻辑 | L124-140 |
+| `authenticationFailed` | 令牌刷新与线性递增重连 | L124-140 |
+
+**`authenticationFailed` 重连机制详解**：
+
+```typescript
+// 实际代码逻辑
+provider.on("authenticationFailed", () => {
+  provider.shouldConnect = false;
+  retryCount.current++;
+
+  // 等待时间: retryCount * 1000 - 1000
+  // 第1次失败: 1*1000-1000 = 0ms (立即重试)
+  // 第2次失败: 2*1000-1000 = 1000ms
+  // 第3次失败: 3*1000-1000 = 2000ms
+  // ...以此类推，线性递增
+  void sleep(retryCount.current * 1000 - 1000).then(() =>
+    auth.fetchAuth().then(() => {
+      provider.setConfiguration({ token: auth.collaborationToken });
+      provider.connect();
+      provider.shouldConnect = true;
+    })
+  );
+});
+```
+
+**关键点**：
+- 这是**线性递增等待**（0s, 1s, 2s, 3s...），不是指数退避
+- 同步成功后 `retryCount.current = 0` 重置计数
+- 仅针对 `authenticationFailed`（令牌过期/无效）场景
+- 普通网络断线由 Hocuspocus Provider 内部自动处理
 
 #### 2.1.3 智能连接管理
 
