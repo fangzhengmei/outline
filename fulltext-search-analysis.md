@@ -271,11 +271,13 @@ public collectionIds = async (options: FindOptions<Collection> = {}) => {
 };
 ```
 
-### 3.2 缓存失效机制（修正：创建和删除都会失效）
+### 3.2 缓存失效机制
+
+#### 3.2.1 已实现的缓存失效：用户直接集合授权
 
 **位置**: `server/models/UserMembership.ts:227-234` 和 `311-318`
 
-之前的报告只提到了删除时失效，实际上 **创建和删除** 时都会失效缓存：
+当用户直接被授予或移除集合权限时，缓存会失效：
 
 ```typescript
 // 新增授权时失效
@@ -306,6 +308,140 @@ static async invalidateCollectionIdsAfterDestroy(model: UserMembership) {
 文档级别的成员资格变化不需要失效缓存，因为：
 1. 文档权限条件 (`$memberships.id$ IS NOT NULL`) 直接通过 JOIN 实时检查
 2. 不依赖 `collectionIds()` 的缓存结果
+
+#### 3.2.2 缺失的缓存失效：用户组相关权限变化
+
+通过代码分析发现，以下三种场景下 **`collectionIds` 缓存不会立即失效**，存在最多 **10秒** 的时间窗口：
+
+| 场景 | 涉及模型 | 是否失效缓存 | 时间窗口 |
+|------|---------|-------------|---------|
+| 用户加入/移出用户组 | `GroupUser` | ❌ 不失效 | 最多 10秒 |
+| 用户组被授予/移除集合权限 | `GroupMembership` | ❌ 不失效 | 最多 10秒 |
+| 用户直接被授予/移除集合权限 | `UserMembership` | ✅ 失效 | 无 |
+
+##### 场景 A：用户加入/移出用户组
+
+**位置**: `server/models/GroupUser.ts` - **没有任何缓存失效钩子**
+
+```typescript
+// GroupUser.ts 中没有 @AfterCreate 或 @AfterDestroy 钩子
+// 整个类只有字段定义和基础关联，没有生命周期钩子
+
+class GroupUser extends Model<...> {
+  // 只有字段定义...
+  @BelongsTo(() => User, "userId")
+  user: User;
+  
+  @ForeignKey(() => User)
+  @Column(DataType.UUID)
+  userId: string;
+  
+  @BelongsTo(() => Group, "groupId")
+  group: Group;
+  
+  // ... 其他字段
+  
+  // 注意：没有任何 @AfterCreate/@AfterDestroy 钩子来失效缓存！
+}
+```
+
+**问题场景**：
+1. 存在一个组 "产品组"，该组对 "产品文档集合" 有读取权限
+2. 用户 A 加入 "产品组"（创建 `GroupUser` 记录）
+3. **缓存不会失效**，用户 A 的 `collectionIds` 缓存中仍然没有 "产品文档集合"
+4. 在接下来的 10秒内，用户 A 搜索时无法通过集合权限条件找到该集合中的文档
+5. 10秒后缓存过期，重新查询时才能获取到正确的集合列表
+
+**影响范围**：
+- 搜索时的 `collectionId IN (collectionIds)` 条件会漏掉新获得权限的集合
+- 但如果该用户对某个文档有直接成员资格，仍然可以搜索到该文档（通过 `$memberships.id$ IS NOT NULL` 条件）
+
+##### 场景 B：用户组被授予/移除集合权限
+
+**位置**: `server/models/GroupMembership.ts:204-322` - 有钩子但不失效 `collectionIds` 缓存
+
+```typescript
+// GroupMembership 的 @AfterCreate 钩子
+@AfterCreate
+static async createSourcedMemberships(...) {
+  // 只处理文档级别的来源成员资格
+  if (model.sourceId || !model.documentId) {
+    return;
+  }
+  return this.recreateSourcedMemberships(model, options);
+}
+
+@AfterCreate
+static async publishAddGroupEventAfterCreate(...) {
+  // 只发布事件，不失效缓存
+  await model.insertEvent(context, "add_group", {
+    membershipId: model.id,
+    isNew: true,
+  });
+}
+
+// @AfterDestroy 钩子类似，也没有失效 collectionIds 缓存
+```
+
+**问题场景**：
+1. 给 "产品组" 授予 "产品文档集合" 的读取权限（创建 `GroupMembership` 记录，`collectionId` 非空）
+2. **缓存不会失效**，该组所有用户的 `collectionIds` 缓存都不会更新
+3. 在接下来的 10秒内，该组的所有用户搜索时都无法通过集合权限条件找到该集合中的文档
+4. 10秒后缓存过期，重新查询时才能获取到正确的集合列表
+
+**影响范围**：
+- 影响该组的**所有用户**
+- 如果用户数为 N，就有 N 个用户的缓存都不会失效
+
+#### 3.2.3 时间窗口分析
+
+**缓存 TTL**: 10秒（`server/models/User.ts:549`）
+
+```typescript
+return (
+  (await CacheHelper.getDataOrSet<string[]>(
+    RedisPrefixHelper.getUserCollectionIdsKey(this.id),
+    fetchCollectionIds,
+    10  // TTL: 10秒
+  )) ?? []
+);
+```
+
+**最大不一致时间窗口**：
+
+| 情况 | 最大等待时间 | 说明 |
+|------|------------|------|
+| 刚缓存后立即变更权限 | 10秒 | 缓存需要等 TTL 过期 |
+| 缓存快过期时变更权限 | 接近 0秒 | 缓存很快就会过期 |
+| 平均情况 | ~5秒 | 假设均匀分布 |
+
+#### 3.2.4 对搜索功能的实际影响
+
+需要注意的是，即使 `collectionIds` 缓存过期，搜索结果的权限过滤仍然有其他保护：
+
+```typescript
+// buildWhere 中的四层权限 OR 条件
+where[Op.or] = [
+  { "$memberships.id$": { [Op.ne]: null } },        // 条件1: 文档用户成员资格（实时）
+  { "$groupMemberships.id$": { [Op.ne]: null } },   // 条件2: 文档组成员资格（实时）
+  { collectionId: collectionIds },                    // 条件3: 集合权限（可能过期）
+  (可选) 用户自己的无集合草稿条件                       // 条件4: 草稿
+]
+```
+
+**影响分析**：
+
+| 条件 | 是否依赖缓存 | 缓存过期时的影响 |
+|------|-------------|-----------------|
+| 条件1：文档用户成员资格 | ❌ 不依赖 | 无影响，通过 JOIN 实时检查 |
+| 条件2：文档组成员资格 | ❌ 不依赖 | 无影响，通过 JOIN 实时检查 |
+| 条件3：集合权限 | ✅ 依赖 `collectionIds` | 可能漏掉新获得权限的集合中的文档 |
+| 条件4：用户自己的无集合草稿 | ❌ 不依赖 | 无影响 |
+
+**结论**：
+- 缓存不一致只会影响通过 **集合权限** 访问的文档
+- 通过 **文档直接成员资格** 访问的文档不受影响
+- 这是一个"权限降级"问题（用户暂时看不到有权限的文档），而不是"权限提升"问题（不会让用户看到无权限的文档）
 
 ---
 
