@@ -1621,6 +1621,615 @@ export default class ShareSubscriptionNotificationsTask extends BaseTask<Revisio
 
 ---
 
+## 8. 邮件摘要/节流机制详解
+
+**重要说明**：Outline 并没有传统意义上的"每日/每小时摘要"（即把多个通知合并成一封邮件批量发送）。但它实现了多种"类摘要"机制，用于减少邮件打扰、优化用户体验。以下是详细分析：
+
+### 8.1 延迟发送（Debounce）：给用户撤销操作的机会
+
+#### 8.1.1 哪些通知会延迟？
+
+**文件**: `server/queues/processors/EmailsProcessor.ts:36-212`
+
+| 通知类型 | 是否延迟 | 延迟时间 | 原因 |
+|----------|----------|----------|------|
+| `PublishDocument` | ❌ 不延迟 | - | 注释: "notification itself is already delayed" |
+| `UpdateDocument` | ❌ 不延迟 | - | 同上面 |
+| `MentionedInDocument` | ❌ 不延迟 | - | 同上面 |
+| `AddUserToDocument` | ✅ 延迟 | 1 分钟 | 让用户有时间撤销共享 |
+| `AddUserToCollection` | ✅ 延迟 | 1 分钟 | 让用户有时间撤销共享 |
+| `CreateCollection` | ✅ 延迟 | 1 分钟 | 让用户有时间调整 |
+| `CreateComment` | ✅ 延迟 | 1 分钟 | 让用户有时间编辑/删除评论 |
+| `UpdateComment` | ✅ 延迟 | 1 分钟 | 让用户有时间继续编辑 |
+| `ResolveComment` | ✅ 延迟 | 1 分钟 | 让用户有时间撤销 |
+| `MentionedInComment` | ✅ 延迟 | 1 分钟 | 让用户有时间编辑评论 |
+| `GroupMentionedInComment` | ✅ 延迟 | 1 分钟 | 让用户有时间编辑评论 |
+
+#### 8.1.2 延迟实现机制
+
+```typescript
+// 示例：AddUserToDocument 的延迟调度
+case NotificationEventType.AddUserToDocument: {
+  await new DocumentSharedEmail(
+    {
+      to: notification.user.email,
+      // ... 其他参数
+    },
+    { notificationId }
+  ).schedule({
+    delay: Minute.ms,  // 延迟 60,000 毫秒
+  });
+  return;
+}
+```
+
+#### 8.1.3 延迟的完整流程图
+
+```
+用户操作（如共享文档给用户）
+         │
+         ▼
+Event.createFromContext() → 保存到 events 表
+         │
+         ▼
+globalEventQueue.add(event) → 队列入队
+         │
+         ▼
+NotificationsProcessor.perform()
+         │
+         ▼
+Notification.create() → 保存到 notifications 表
+         │
+         ▼
+Notification.createEvent() → 触发 notifications.create 事件
+         │
+         ▼
+EmailsProcessor.perform()
+         │
+         ▼
+EmailClass.schedule({ delay: 60000 })  ← 关键：延迟 1 分钟
+         │
+         ▼
+taskQueue.add(job, { delay: 60000 })  ← Bull 队列延迟
+         │
+         │  等待 1 分钟...
+         │
+         ▼
+EmailTask.perform() → 实例化邮件类
+         │
+         ▼
+BaseEmail.send()
+         │
+         ├──▶ 检查通知是否已被查看（viewedAt）
+         │       ├── 是 → 取消发送，记录日志
+         │       └── 否 → 继续
+         │
+         └──▶ 检查文档/对象是否存在
+                 ├── 否 → beforeSend 返回 false，取消发送
+                 └── 是 → 继续
+         │
+         ▼
+mailer.sendMail() → 通过 SMTP 投递
+```
+
+#### 8.1.4 延迟期间的"撤销"机制
+
+在 1 分钟延迟期间，用户有以下方式可以"撤销"邮件发送：
+
+| 方式 | 实现位置 | 原理 |
+|------|----------|------|
+| **撤销共享** | 删除 `UserMembership` | 不会阻止已创建的 Notification |
+| **删除文档** | 删除 `Document` | `beforeSend` 钩子检测文档不存在，返回 `false` |
+| **删除评论** | 删除 `Comment` | 邮件模板 `beforeSend` 可能检测到评论不存在 |
+| **用户查看通知** | 用户点击 Web 通知 | `Notification.viewedAt` 被设置，`send()` 检查到后取消发送 |
+
+### 8.2 节流（Throttle）：限制通知频率
+
+#### 8.2.1 分享订阅的 6 小时节流
+
+**文件**: `server/queues/tasks/ShareSubscriptionNotificationsTask.ts:57-85`
+
+这是最接近"摘要"概念的机制。分享订阅的通知会被节流，每 6 小时最多发送一次：
+
+```typescript
+// 节流逻辑
+if (
+  subscription.lastNotifiedAt &&
+  subscription.lastNotifiedAt > subHours(new Date(), 6)
+) {
+  Logger.info(
+    "processor",
+    `suppressing share subscription notification to ${subscription.id} as recently notified`
+  );
+  continue;  // 跳过本次通知
+}
+
+// 如果允许发送
+await new ShareDocumentUpdatedEmail({ ... }).schedule();
+
+// 更新最后通知时间
+subscription.lastNotifiedAt = new Date();
+await subscription.save();
+```
+
+#### 8.2.2 分享订阅节流完整流程
+
+```
+文档有新修订（revisions.create 事件）
+         │
+         ▼
+globalEventQueue.add(event)
+         │
+         ▼
+NotificationsProcessor 路由到 ShareSubscriptionNotificationsTask
+         │
+         ▼
+ShareSubscriptionNotificationsTask.perform()
+         │
+         ├──▶ 查找所有活跃的分享订阅（active scope）
+         │
+         ├──▶ 遍历每个订阅
+         │       │
+         │       └──▶ 检查 lastNotifiedAt
+         │               │
+         │               ├──▶ 距离上次通知 < 6 小时 → 跳过，记录日志
+         │               │
+         │               └──▶ 距离上次通知 >= 6 小时 → 继续
+         │
+         ▼
+ShareDocumentUpdatedEmail.schedule()
+         │
+         ▼
+taskQueue.add(EmailTask)
+         │
+         ▼
+EmailTask.perform()
+         │
+         ▼
+mailer.sendMail() → SMTP 投递
+         │
+         ▼
+更新 subscription.lastNotifiedAt = new Date()
+```
+
+#### 8.2.3 节流的行为特点
+
+| 特性 | 行为 |
+|------|------|
+| **窗口大小** | 6 小时 |
+| **首次触发** | 立即发送 |
+| **后续触发** | 必须等待 6 小时窗口结束 |
+| **合并方式** | **不合并**，只发送最新的一次更新 |
+| **丢失内容** | 窗口内的中间更新会被跳过 |
+
+**注意**：这不是真正的"摘要"（把多个更新合并成一封邮件显示），而是**节流**（限制发送频率，只保留最新的）。用户收到的邮件只包含**最后一次**更新的信息，中间的更新不会被聚合显示。
+
+### 8.3 智能过滤：避免不必要的邮件
+
+#### 8.3.1 已查看免打扰
+
+**文件**: `server/emails/templates/BaseEmail.tsx:822-837`
+
+```typescript
+// 如果通知已被查看，则不发送邮件
+if (notification?.viewedAt) {
+  Logger.info(
+    "email",
+    `Email ${templateName} not sent as already viewed`,
+    this.props
+  );
+  return;
+}
+```
+
+**触发时机**：用户在 Web 界面查看了通知中心的通知。
+
+**工作原理**：
+1. 用户点击 Web 通知 → `Notification.viewedAt` 被设置为当前时间
+2. 延迟的邮件任务终于执行
+3. `BaseEmail.send()` 检查 `notification.viewedAt` 不为空
+4. 取消发送邮件，记录日志
+
+#### 8.3.2 评论后查看免打扰
+
+**文件**: `server/models/helpers/NotificationHelper.ts:118-146`
+
+```typescript
+for (const recipient of recipients) {
+  // ... 其他检查 ...
+
+  // 如果用户在评论创建后查看过文档，则不发送评论通知
+  const view = await View.findOne({
+    where: {
+      userId: recipient.id,
+      documentId: document.id,
+      updatedAt: {
+        [Op.gt]: comment.createdAt,  // 查看时间晚于评论创建时间
+      },
+    },
+  });
+
+  if (view) {
+    Logger.info(
+      "processor",
+      `suppressing notification to ${recipient.id} because doc viewed`
+    );
+    continue;  // 跳过这个用户
+  }
+
+  // ... 继续处理
+}
+```
+
+**适用场景**：用户 A 在文档中评论 → 用户 B 打开文档查看 → 用户 B 已经看到了评论，不需要再发邮件通知。
+
+#### 8.3.3 操作执行者免打扰
+
+**文件**: `server/models/helpers/NotificationHelper.ts:28-42`（示例）
+
+```typescript
+// 排除操作执行者本人
+let recipients = await User.findAll({
+  where: {
+    id: {
+      [Op.ne]: actorId,  // 不等于操作执行者
+    },
+    // ... 其他条件
+  },
+});
+```
+
+**原理**：自己的操作不会给自己发通知。
+
+### 8.4 去重机制：避免同一事件多次通知
+
+#### 8.4.1 文档提及去重
+
+**文件**: `server/queues/tasks/DocumentPublishedNotificationsTask.ts:21-51`
+
+```typescript
+// 使用数组去重
+const userIdsMentioned: string[] = [];
+
+for (const mention of mentions) {
+  if (userIdsMentioned.includes(mention.modelId)) {
+    continue;  // 已处理过，跳过
+  }
+
+  // 处理通知...
+  await Notification.create({ ... });
+  
+  userIdsMentioned.push(recipient.id);  // 标记已处理
+}
+```
+
+**场景**：同一文档中多次 @ 同一个用户，不会创建多个通知。
+
+#### 8.4.2 订阅者去重
+
+**文件**: `server/models/helpers/NotificationHelper.ts:208-211`
+
+```typescript
+import uniqBy from "lodash/uniqBy";
+
+// 对集合订阅和文档订阅的用户去重
+recipients = uniqBy(
+  [...collectionSubs, ...documentSubs].map((s) => s.user),
+  (user) => user.id
+);
+```
+
+**场景**：用户同时订阅了集合和该集合下的某个文档，只会收到一次通知。
+
+### 8.5 邮件线程分组：客户端层面的"伪摘要"
+
+#### 8.5.1 邮件线程 References 机制
+
+**文件**: `server/models/Notification.ts:263-289`
+
+Outline 使用 `References` 和 `Message-ID` 邮件头，让同一主题的通知在邮件客户端（如 Gmail、Outlook）中形成线程：
+
+```typescript
+public static async emailReferences(
+  notification: Notification
+): Promise<string[] | undefined> {
+  let name: string | undefined;
+
+  switch (notification.event) {
+    case NotificationEventType.PublishDocument:
+    case NotificationEventType.UpdateDocument:
+      name = `${notification.documentId}-updates`;  // 按文档 ID 分组
+      break;
+      
+    case NotificationEventType.GroupMentionedInComment:
+    case NotificationEventType.GroupMentionedInDocument:
+      name = `${notification.documentId}-group-mentions`;  // 群组提及分组
+      break;
+      
+    case NotificationEventType.MentionedInDocument:
+    case NotificationEventType.MentionedInComment:
+      name = `${notification.documentId}-mentions`;  // 用户提及分组
+      break;
+      
+    case NotificationEventType.CreateComment: {
+      const comment = await Comment.findByPk(notification.commentId);
+      name = `${comment?.parentCommentId ?? comment?.id}-comments`;  // 评论线程
+      break;
+    }
+  }
+
+  return name ? [this.emailMessageId(name)] : undefined;
+}
+```
+
+#### 8.5.2 线程分组策略
+
+| 通知类型 | 分组 Key | 效果 |
+|----------|-----------|------|
+| 文档发布/更新 | `{documentId}-updates` | 同一文档的所有更新在一个线程 |
+| 用户提及 | `{documentId}-mentions` | 同一文档的所有 @ 提及在一个线程 |
+| 群组提及 | `{documentId}-group-mentions` | 同一文档的所有群组 @ 在一个线程 |
+| 评论 | `{commentId}-comments` | 同一评论线程的所有回复在一起 |
+
+#### 8.5.3 这不是真正的"摘要"
+
+**重要区别**：
+
+| 特性 | 邮件线程分组 | 真正的摘要 |
+|------|-------------|-----------|
+| **发送方式** | 每事件单独发送 | 定期批量发送 |
+| **客户端显示** | 折叠在一个线程中 | 合并成一封邮件显示 |
+| **内容聚合** | 无，每封是独立的 | 有，把多个事件内容合并 |
+| **延迟** | 无（除了 1 分钟延迟） | 按周期延迟（如每日 8:00） |
+
+**邮件线程分组的本质**：这是**邮件客户端**的显示优化，不是**发送时**的聚合。Outline 仍然发送多封邮件，只是这些邮件共享同一个 `References` 头，让邮件客户端把它们折叠在一起。
+
+### 8.6 五种"类摘要"机制汇总
+
+| 机制 | 触发时机 | 位置 | 效果 | 代码位置 |
+|------|----------|------|------|----------|
+| **延迟发送** | 邮件调度时 | EmailsProcessor | 1 分钟后发送，给用户撤销机会 | `delay: Minute.ms` |
+| **节流** | 分享订阅通知时 | ShareSubscriptionNotificationsTask | 6 小时内最多发送一次 | `lastNotifiedAt` 检查 |
+| **已查看免打扰** | 邮件发送时 | BaseEmail.send() | 用户已在 Web 查看通知则不发邮件 | `notification.viewedAt` 检查 |
+| **评论后查看免打扰** | 通知生成时 | NotificationHelper | 用户查看过文档则不发评论通知 | `View.findOne()` 检查 |
+| **邮件线程** | 邮件发送时 | Notification.emailReferences() | 邮件客户端把同类通知折叠 | `References` 邮件头 |
+
+### 8.7 各类通知的完整流程图
+
+#### 8.7.1 实时通知（无延迟/有延迟）
+
+```
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│                           类型 1: 无延迟通知 (实时)                                   │
+│  PublishDocument, UpdateDocument, MentionedInDocument                                │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+         │
+         ▼
+用户操作 → Event.createFromContext() → globalEventQueue
+         │
+         ▼
+NotificationsProcessor → Notification.create()
+         │
+         ▼
+notifications.create 事件 → EmailsProcessor
+         │
+         ▼
+Email.schedule() → 无 delay 参数，立即入队
+         │
+         ▼
+EmailTask.perform() → BaseEmail.send()
+         │
+         ├──▶ 检查 viewedAt → 已查看？→ 取消发送
+         │
+         └──▶ 检查对象是否存在 → 不存在？→ beforeSend 返回 false
+         │
+         ▼
+mailer.sendMail() → SMTP 投递
+
+────────────────────────────────────────────────────────────────────────────────────────
+
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│                           类型 2: 有延迟通知 (Debounce)                               │
+│  AddUserToDocument, CreateComment, MentionedInComment 等                            │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+         │
+         ▼
+用户操作 → Event.createFromContext() → globalEventQueue
+         │
+         ▼
+NotificationsProcessor → Notification.create()
+         │
+         ▼
+notifications.create 事件 → EmailsProcessor
+         │
+         ▼
+Email.schedule({ delay: 60000 }) ← 延迟 1 分钟
+         │
+         │  1 分钟内用户可以：
+         │    - 删除文档/评论
+         │    - 查看 Web 通知 (设置 viewedAt)
+         │    - 撤销共享
+         │
+         ▼
+EmailTask.perform() → BaseEmail.send()
+         │
+         ├──▶ 检查 viewedAt → 已查看？→ 取消发送 ✅
+         │
+         └──▶ beforeSend() → 对象不存在？→ 返回 false，取消发送 ✅
+         │
+         ▼
+mailer.sendMail() → SMTP 投递
+```
+
+#### 8.7.2 分享订阅通知（节流）
+
+```
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│                           类型 3: 分享订阅通知 (Throttle)                             │
+│  公开分享链接的订阅者接收文档更新                                                       │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+         │
+         ▼
+文档更新 → revisions.create 事件 → globalEventQueue
+         │
+         ▼
+NotificationsProcessor → ShareSubscriptionNotificationsTask.perform()
+         │
+         ▼
+查找活跃的分享订阅 → ShareSubscription.scope("active")
+         │
+         ▼
+遍历每个订阅
+         │
+         ├──▶ 检查 lastNotifiedAt
+         │       │
+         │       ├──▶ 6 小时内？→ 跳过，记录日志 ⏸️
+         │       │
+         │       └──▶ 6 小时外？→ 继续 ▶️
+         │
+         ▼
+ShareDocumentUpdatedEmail.schedule()
+         │
+         ▼
+EmailTask.perform() → BaseEmail.send() → mailer.sendMail()
+         │
+         ▼
+更新 subscription.lastNotifiedAt = new Date()
+```
+
+#### 8.7.3 完整链路：从事件到 SMTP
+
+```
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│                              统一链路：所有通知类型                                    │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+
+阶段 1: 事件产生
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│  API/Routes                                                                           │
+│  ├── documents.publish                                                                │
+│  ├── revisions.create                                                                 │
+│  ├── comments.create                                                                  │
+│  ├── documents.add_user                                                               │
+│  └── collections.add_user                                                             │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+         │
+         ▼ Event.createFromContext()
+
+阶段 2: 事件存储与入队
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│  Event 模型                                                                           │
+│  ├── save() → 保存到 PostgreSQL events 表                                            │
+│  └── @AfterSave enqueue() → globalEventQueue.add(event)                             │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+         │
+         ▼ Worker 消费 globalEventQueue
+
+阶段 3: 通知生成（Processor）
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│  NotificationsProcessor 或其他 Processor                                              │
+│  ├── 解析事件数据                                                                      │
+│  ├── 查找接收者（订阅者、提及用户、团队成员等）                                           │
+│  ├── 去重（uniqBy、userIdsMentioned 数组）                                             │
+│  ├── 过滤（排除自己、检查访问权限、检查是否已查看）                                       │
+│  └── Notification.create() → 保存到 notifications 表                                  │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+         │
+         ▼ Notification.@AfterCreate createEvent()
+
+阶段 4: 邮件调度（EmailsProcessor）
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│  EmailsProcessor                                                                      │
+│  ├── 根据 notification.event 选择邮件模板                                             │
+│  │       ├── PublishDocument → DocumentPublishedOrUpdatedEmail                       │
+│  │       ├── CreateComment → CommentCreatedEmail                                     │
+│  │       ├── AddUserToDocument → DocumentSharedEmail                                 │
+│  │       └── ...                                                                      │
+│  │
+│  └── 调用 Email.schedule()                                                           │
+│          ├── 部分类型：无 delay → 立即入队                                            │
+│          └── 部分类型：delay: Minute.ms → 延迟 1 分钟入队                            │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+         │
+         ▼ taskQueue.add(EmailTask)
+
+阶段 5: 邮件发送（EmailTask）
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│  EmailTask.perform()                                                                  │
+│  ├── 根据 templateName 获取邮件类                                                     │
+│  ├── new EmailClass(props, metadata)                                                 │
+│  └── email.send()                                                                     │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+         │
+         ▼
+
+阶段 6: 发送前检查（BaseEmail.send()）
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│  BaseEmail.send()                                                                     │
+│  ├── beforeSend() 钩子                                                                │
+│  │       ├── 加载关联数据（文档、用户、评论等）                                         │
+│  │       ├── 检查对象是否存在 → 不存在则返回 false 取消发送                            │
+│  │       └── 准备渲染数据（diff、unsubscribeUrl 等）                                  │
+│  │
+│  ├── 检查 viewedAt                                                                    │
+│  │       └── notification.viewedAt 非空 → 取消发送                                    │
+│  │
+│  ├── 生成邮件线程信息                                                                  │
+│  │       ├── Message-ID: <notification-id@domain>                                    │
+│  │       └── References: <document-id-updates@domain>                                │
+│  │
+│  ├── 渲染邮件内容                                                                      │
+│  │       ├── render() → React 组件                                                    │
+│  │       └── renderAsText() → 纯文本版本                                              │
+│  │
+│  └── 调用 mailer.sendMail()                                                           │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+         │
+         ▼
+
+阶段 7: SMTP 投递（Mailer）
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│  Mailer.sendMail()                                                                    │
+│  ├── Oy.renderTemplate() → 将 React 组件渲染为 HTML                                   │
+│  │
+│  ├── nodemailer transporter.sendMail()                                               │
+│  │       ├── 配置来源：                                                               │
+│  │       │       ├── SMTP_HOST + SMTP_PORT (自定义 SMTP)                             │
+│  │       │       └── SMTP_SERVICE (知名服务如 Gmail)                                  │
+│  │       │
+│  │       ├── TLS 配置：                                                               │
+│  │       │       ├── SMTP_SECURE (是否使用 SSL)                                       │
+│  │       │       ├── SMTP_DISABLE_STARTTLS                                           │
+│  │       │       └── SMTP_TLS_CIPHERS                                                 │
+│  │       │
+│  │       └── 认证：                                                                   │
+│  │               ├── SMTP_USERNAME                                                    │
+│  │               └── SMTP_PASSWORD                                                    │
+│  │
+│  └── 邮件头：                                                                         │
+│          ├── From: SMTP_FROM_EMAIL                                                   │
+│          ├── To: 收件人邮箱                                                           │
+│          ├── Subject: 邮件主题                                                        │
+│          ├── Message-ID: 用于唯一标识                                                 │
+│          ├── References: 用于邮件线程                                                 │
+│          └── List-Unsubscribe: 一键退订                                               │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+         │
+         ▼
+
+阶段 8: 投递完成
+┌──────────────────────────────────────────────────────────────────────────────────────┐
+│  SMTP 服务器 → 收件人邮箱                                                              │
+│                                                                                        │
+│  同时：                                                                                │
+│  ├── 更新 Notification.emailedAt = new Date()                                        │
+│  ├── 更新 ShareSubscription.lastNotifiedAt = new Date()（如果是分享订阅）              │
+│  └── 记录指标：Metrics.increment("email.sent")                                        │
+└──────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
 ## 7. 关键设计特点
 
 ### 7.1 可靠性设计
