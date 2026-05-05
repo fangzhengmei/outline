@@ -1558,22 +1558,54 @@ try {
 
 #### 什么情况会触发重试？
 
-| 场景 | 是否重试 | 原因 |
-|------|---------|------|
-| SMTP 服务器连接超时 | ✅ 是 | `mailer.sendMail()` 抛出错误 |
-| 邮箱不存在（5xx 错误） | ❌ 否 | 通常配置为不重试永久错误 |
-| 邮件被临时拒绝（4xx） | ✅ 是 | 临时故障，可重试 |
-| 数据库查询失败 | ✅ 是 | 加载 Notification 时失败 |
-| 通知已被查看（viewedAt 已设置） | ❌ 否 | 幂等检查通过，正常返回 |
-| 通知已发送（emailedAt 已设置） | ❌ 否 | 幂等保护 |
+**⚠️ **重要修正**：代码中**没有区分临时错误和永久错误**，所有抛出的异常都会触发重试。
+
+**证据代码**：
+
+`server/emails/mailer.tsx:197-200
+```typescript
+} catch (err) {
+  Logger.error(`Error sending email to ${data.to}`, err);
+  throw err; // Re-throw for queue to re-try
+}
+```
+
+注释明确写着 `"Re-throw for queue to re-try`，没有任何错误分类逻辑。
+
+**实际重试行为：
+
+| 场景 | 是否重试 | 实际行为 |
+|------|---------|---------|
+| SMTP 服务器连接超时 | ✅ 是 | 抛出错误，触发重试 |
+| 邮箱不存在（5xx 错误） | ✅ 是 | **所有错误都会重试 ⚠️ |
+| 邮件被临时拒绝（4xx） | ✅ 是 | 抛出错误，触发重试 |
+| 数据库查询失败 | ✅ 是 | 加载 Notification 时失败会抛出 |
+| 通知已被查看（viewedAt 已设置） | ❌ 否 | 幂等检查通过，正常 `return` |
+| 通知已发送（emailedAt 已设置） | ❌ 否 | 当前代码未检查，但任务完成后 `removeOnComplete: true` |
+
+**关键配置说明**：
+
+`server/queues/queue.ts:37-41`
+```typescript
+defaultJobOptions: {
+  removeOnComplete: true,  // 成功后移除
+  removeOnFail: true,      // 最终失败后移除
+  ...defaultJobOptions,
+},
+```
+
+- `removeOnFail: true` 表示**最终失败后**从队列移除，不影响重试过程本身
+- 重试仍会发生最多 5 次尝试后才移除
 
 ---
 
 ### 10.5 幂等性保证机制
 
-邮件通道有**多层幂等保护**：
+#### 实际幂等性分析
 
-#### 层面 1：发送前检查 `viewedAt`
+邮件通道的幂等性**有局限性**，需要仔细分析：
+
+#### 层面 1：发送前检查 `viewedAt`（有效幂等
 
 ```typescript
 // BaseEmail.tsx:136-143
@@ -1583,12 +1615,16 @@ if (notification?.viewedAt) {
 }
 ```
 
+**✅ **有效幂等保护**：
+- 如果用户已在前端查看通知，重试时会直接返回
+- 这是最可靠的幂等机制
+
 **触发时机**：
 - 用户点击通知列表中的通知
 - 用户打开包含通知的页面
 - API `notifications.update` 被调用设置 `viewedAt`
 
-#### 层面 2：发送后设置 `emailedAt`
+#### 层面 2：`emailedAt` 标记（审计用途，非幂等保护）
 
 ```typescript
 // BaseEmail.tsx:191-198
@@ -1602,18 +1638,18 @@ if (notification) {
 }
 ```
 
-**作用**：
-- 标记邮件已发送
-- 虽然 `removeOnComplete: true` 使任务不会重复执行
-- 但提供了审计追踪能力
+⚠️ **重要发现**：这段代码在 `send()` 方法中**发送后**才设置 `emailedAt`，而且**没有在发送前检查** `emailedAt`。
 
-#### 层面 3：延迟发送 + viewedAt 检查
+**实际效果**：
+- `emailedAt` 仅用于**审计追踪**
+- **不提供幂等保护
+- 如果邮件发送成功但数据库更新失败，**重试可能导致重复发送
 
-这是最巧妙的设计：
+#### 层面 3：延迟发送 + viewedAt 检查（核心幂等设计）
+
+这是最巧妙的设计，通过时间线示例：
 
 ```
-时间线示例：
-
 T=0s:     用户 A 评论并提及用户 B
           → Notification.create() 执行
           → "notifications.create" 事件调度
@@ -1627,6 +1663,47 @@ T=60s:    EmailTask 执行
           → 直接返回，不发送邮件
           → 用户 B 不会收到"已读"邮件
 ```
+
+#### 层面 4：Message-ID 去重（邮件协议层面）
+
+`server/models/Notification.ts` 中定义了 `emailMessageId` 静态方法：
+
+```typescript
+// BaseEmail.tsx:145-151
+const messageId = notification
+  ? Notification.emailMessageId(notification.id)
+  : undefined;
+
+const references = notification
+  ? await Notification.emailReferences(notification)
+  : undefined;
+
+// 发送时设置 messageId
+await mailer.sendMail({
+  messageId,      // ⭐ 基于 notification.id 生成
+  references,   // 用于邮件线程
+  // ...
+});
+```
+
+**作用**：
+- `messageId` 基于 `notification.id` 生成，确保同一通知的邮件有相同的 Message-ID
+- 某些邮件服务器可基于 Message-ID 去重
+- 但这是**邮件协议层面**的去重，不是应用层面的保证
+
+#### 幂等性总结
+
+| 机制 | 可靠性 | 说明 |
+|------|--------|------|
+| `viewedAt` 检查 | ✅ 高 | 发送前检查，用户已查看则不发送 |
+| 延迟 1 分钟 | ✅ 高 | 给用户时间在前端查看 |
+| `emailedAt` 标记 | ❌ 低 | 仅审计，发送前不检查 |
+| Message-ID | ⚠️ 中 | 依赖邮件服务器支持 |
+
+**潜在风险**：
+- 如果邮件发送成功但 `emailedAt` 更新失败，且用户未查看通知
+- **重试时会再次发送邮件
+- 这是一个**可能导致重复发送的边界情况
 
 ---
 
