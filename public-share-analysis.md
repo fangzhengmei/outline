@@ -624,25 +624,57 @@ public cannot = (
 
 ### 5.4 页面能力差异对比
 
+**关键发现**：三类身份在页面能力上**完全相同**，都受分享场景约束。
+
 | 能力 | 匿名访问 | 已登录但无权限 | 已登录且有权限 | 原因说明 |
 |------|---------|---------------|---------------|----------|
-| **编辑能力** | ❌ 只读 | ❌ 只读 | ✅ 根据权限 | 共享页面强制 `readOnly: true` |
-| **命令栏** | `SharedCommandBar` | `SharedCommandBar` | 完整 `CommandBar` | 受限功能集 vs 完整功能 |
-| **侧边栏** | `SharedSidebar` | `SharedSidebar` | 完整侧边栏 | 仅显示共享树 vs 完整导航 |
-| **评论功能** | ❌ 禁用 | ❌ 禁用 | ✅ 根据权限 | 协作功能仅对有权限用户开放 |
-| **任务功能** | ❌ 禁用 | ❌ 禁用 | ✅ 根据权限 | 协作功能仅对有权限用户开放 |
-| **提及功能** | ❌ 禁用 | ❌ 禁用 | ✅ 根据权限 | 协作功能仅对有权限用户开放 |
-| **品牌展示** | ⚠️ 可能显示 | ⚠️ 可能显示 | ❌ 不显示 | 非自定义域名且无用户时显示 |
-| **嵌入支持** | ✅ 可选 | ✅ 可选 | 不适用 | iframe 嵌入控制 |
-| **订阅功能** | ✅ 可选 | ✅ 可选 | 不适用 | 基于 `allowSubscriptions` 设置 |
+| **编辑能力** | ❌ 强制只读 | ❌ 强制只读 | ❌ 强制只读 | `Shared` 组件中 `readOnly` 硬编码为 `true` |
+| **命令栏** | `SharedCommandBar`（仅搜索） | `SharedCommandBar`（仅搜索） | `SharedCommandBar`（仅搜索） | 路由固定使用 `SharedCommandBar` |
+| **侧边栏** | `SharedSidebar`（仅共享树） | `SharedSidebar`（仅共享树） | `SharedSidebar`（仅共享树） | 路由固定使用 `SharedSidebar` |
+| **评论功能** | ❌ 禁用 | ❌ 禁用 | ❌ 禁用 | `abilities = {}` 空权限对象 |
+| **任务功能** | ❌ 禁用 | ❌ 禁用 | ❌ 禁用 | `abilities = {}` 空权限对象 |
+| **提及功能** | ❌ 禁用 | ❌ 禁用 | ❌ 禁用 | `abilities = {}` 空权限对象 |
+| **品牌展示** | ⚠️ 可能显示 | ⚠️ 可能显示 | ❌ 不显示 | 仅 `!user` 时显示 |
+| **嵌入支持** | ✅ 可选 | ✅ 可选 | ✅ 可选 | 基于团队 `preventEmbedding` 偏好 |
+| **订阅功能** | ✅ 可选 | ✅ 可选 | ✅ 可选 | 基于 `share.allowSubscriptions` 设置 |
 
-**代码依据**（`app/scenes/Shared/Document.tsx`）：
+**代码依据 1：路由配置**（`app/routes/index.tsx`）：
+
+```typescript
+// 关键：/s/:shareId 路由不在 Authenticated 组件内部
+<Route exact path="/s/:shareId" component={Shared} />
+<Route exact path={`/s/:shareId/doc/${documentSlug}`} component={Shared} />
+
+<Authenticated>
+  <AuthenticatedRoutes />  // 团队完整视图路由在这里
+</Authenticated>
+```
+
+**代码依据 2：SharedScene 组件**（`app/scenes/Shared/index.tsx`）：
+
+```typescript
+function SharedScene() {
+  // ...
+  return (
+    <>
+      <Layout
+        title={pageTitle}
+        sidebar={hasSidebar ? <Sidebar share={share} /> : null}  // SharedSidebar
+      >
+        {/* 文档/集合渲染 */}
+      </Layout>
+      <SharedCommandBar />  {/* 固定使用 SharedCommandBar */}
+    </>
+  );
+}
+```
+
+**代码依据 3：SharedDocument 组件**（`app/scenes/Shared/Document.tsx`）：
 
 ```typescript
 function SharedDocument({ document }: Props) {
-  // ...
-  const abilities = useMemo(() => ({}), []);  // 空权限对象
-  const showBranding = !isCustomDomain && !user;  // 品牌展示条件
+  const abilities = useMemo(() => ({}), []);  // 空权限对象，硬编码
+  const showBranding = !isCustomDomain && !user;  // 仅无用户时显示品牌
   
   return (
     <>
@@ -651,11 +683,29 @@ function SharedDocument({ document }: Props) {
         document={document}
         shareId={shareId}
         tocPosition={tocPosition}
-        readOnly                // 强制只读
+        readOnly                // 硬编码为 true，强制只读
       />
       {showBranding ? (
         <Branding href="//www.getoutline.com?ref=sharelink" />
       ) : null}
+    </>
+  );
+}
+```
+
+**代码依据 4：SharedCommandBar 组件**（`app/components/CommandBar/SharedCommandBar.tsx`）：
+
+```typescript
+/**
+ * A simplified command bar for public shares that only provides search.
+ */
+function SharedCommandBar() {
+  return (
+    <>
+      <SharedSearchActions />  {/* 仅搜索功能 */}
+      <KBarPortal>
+        {/* 仅搜索结果展示，没有创建文档、导航等完整功能 */}
+      </KBarPortal>
     </>
   );
 }
