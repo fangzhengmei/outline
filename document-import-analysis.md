@@ -379,55 +379,138 @@ protected async buildTasksInput(
 **文件**：`plugins/notion/server/notion.ts`
 
 **核心特性**：
-- **速率限制**：每秒 3 次请求（Notion API 限制）
+- **双层速率限制**：实现默认限流 + 平台硬限制处理
 - **自动重试**：超时和速率限制错误
 - **递归获取**：自动获取 block 的子节点
 
-**速率限制配置** (`notion.ts:71-88`):
+##### 实现默认限流（客户端主动限流）
+
+这是在客户端层面主动控制请求速率，**避免触发** Notion 平台的限流。
+
+**配置** (`notion.ts:71-88`):
 ```typescript
 constructor(
   accessToken: string,
   rateLimit: { window: number; limit: number } = {
-    window: Second.ms,  // 1 秒
-    limit: 3,           // 3 次请求
+    window: Second.ms,  // 1 秒（时间窗口）
+    limit: 3,           // 3 次请求（窗口内最大请求数）
   },
   // ...
 ) {
   this.client = new Client({ auth: accessToken });
   this.limiter = RateLimit(rateLimit.limit, {
     timeUnit: rateLimit.window,
-    uniformDistribution: true,  // 均匀分布
+    uniformDistribution: true,  // 均匀分布，避免突发请求
   });
+  // ...
 }
 ```
 
-**带重试的 API 调用** (`notion.ts:96-157`):
+**限流机制**：
+- 使用 `async-sema` 库的 `RateLimit`
+- **默认配置**：每秒 3 次请求（`window: 1000ms, limit: 3`）
+- **均匀分布** (`uniformDistribution: true`)：在 1 秒内均匀分配 3 次请求，避免突发流量
+- **使用方式**：每次 API 调用前调用 `await this.limiter()` 等待令牌
+
+**特点**：
+- 这是**主动限流**，在客户端控制请求速率
+- 目的是**避免触发** Notion 平台的硬限制
+- 配置是**代码硬编码**的默认值
+
+##### 平台硬限制（服务端被动限流）
+
+当客户端限流失效或请求量过大时，Notion 服务端会返回 **429 Too Many Requests** 错误，这就是**平台硬限制**。
+
+**错误处理** (`notion.ts:125-151`):
+```typescript
+// 检查是否为速率限制错误
+if (
+  error instanceof APIResponseError &&
+  error.code === APIErrorCode.RateLimited  // Notion API 返回的限流错误码
+) {
+  if (retries < this.maxRetries) {
+    retries++;
+    const headers = error.headers as Record<string, string>;
+    
+    // 读取 Retry-After header 获取需要等待的时间
+    const retryAfter = headers["Retry-After"]
+      ? parseInt(headers["Retry-After"], 10) * 1000  // 转换为毫秒
+      : undefined;
+    
+    // 优先使用服务端建议的等待时间，否则使用指数退避
+    const delay = retryAfter ?? this.retryDelay * retries;
+    
+    Logger.info(
+      "task",
+      `Notion API rate limit hit, retrying in ${delay}ms (retry ${retries}/${this.maxRetries})`
+    );
+
+    // 等待后重试
+    await new Promise((resolve) => setTimeout(resolve, delay));
+    continue;
+  }
+  
+  // 超过最大重试次数
+  Logger.warn(
+    `Notion API rate limit exceeded after ${this.maxRetries} retries`,
+    { error: error.message }
+  );
+}
+```
+
+**特点**：
+- 这是**被动限流**，当 Notion 服务端返回 `APIErrorCode.RateLimited` 时触发
+- 读取 `Retry-After` header 获取服务端建议的等待时间
+- 如果没有 `Retry-After`，使用**指数退避**策略（`retryDelay * retries`）
+- 最多重试 **3 次**
+
+##### 两种限流的对比
+
+| 特性 | 实现默认限流 | 平台硬限制 |
+|------|-------------|-----------|
+| **层面** | 客户端主动控制 | 服务端被动返回 |
+| **触发时机** | 每次 API 调用前（等待令牌） | 收到服务端 429 响应后 |
+| **配置来源** | 代码硬编码（默认值） | Notion 服务端动态返回 |
+| **等待策略** | 均匀分布（RateLimit 库） | 指数退避 + Retry-After header |
+| **目的** | 避免触发限流 | 处理已触发的限流 |
+| **重试机制** | 无（只是等待） | 最多 3 次重试 |
+| **错误码** | 无 | `APIErrorCode.RateLimited` |
+
+**带重试的 API 调用完整流程** (`notion.ts:96-157`):
 ```typescript
 private async fetchWithRetry<T>(apiCall: () => Promise<T>): Promise<T> {
   let retries = 0;
 
   while (true) {
     try {
-      await this.limiter();  // 等待速率限制
+      // 第一层：实现默认限流 - 主动等待令牌
+      await this.limiter();
       return await apiCall();
     } catch (error) {
-      // 处理超时
+      // 处理超时错误
       if (error instanceof RequestTimeoutError) {
         if (retries < this.maxRetries) {
           retries++;
-          await new Promise((resolve) => setTimeout(resolve, delay));
+          await new Promise((resolve) => setTimeout(resolve, this.retryDelay * retries));
           continue;
         }
       }
       
-      // 处理速率限制
+      // 第二层：平台硬限制 - 被动处理服务端返回的限流
       if (error instanceof APIResponseError && 
           error.code === APIErrorCode.RateLimited) {
-        // 读取 Retry-After header
-        const retryAfter = headers["Retry-After"] 
-          ? parseInt(headers["Retry-After"], 10) * 1000 
-          : undefined;
-        // ... 重试逻辑
+        if (retries < this.maxRetries) {
+          retries++;
+          // 读取 Retry-After header
+          const headers = error.headers as Record<string, string>;
+          const retryAfter = headers["Retry-After"]
+            ? parseInt(headers["Retry-After"], 10) * 1000
+            : undefined;
+          const delay = retryAfter ?? this.retryDelay * retries;
+          
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          continue;
+        }
       }
       
       throw error;
