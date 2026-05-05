@@ -538,37 +538,607 @@ router.get("*", async (ctx, next) => {
 
 ---
 
-## 5. 差异对比总结
+## 5. 三类身份下的可见差异深度分析
 
-### 5.1 数据层差异
+### 5.1 三类身份定义
 
-| 维度 | 公开共享视图 | 登录用户视图 |
-|------|-------------|-------------|
-| **用户信息** | 隐藏 createdBy、updatedBy、collaboratorIds | 完整显示 |
-| **结构信息** | 隐藏 collectionId、parentDocumentId | 完整显示 |
-| **时间戳** | 可选隐藏 updatedAt | 完整显示 |
-| **协作数据** | 隐藏 tasks、comments | 完整显示 |
-| **内部设置** | 隐藏 sharing、commenting、permission 等 | 完整显示 |
-| **文档内容** | 移除评论标记，重写内部链接 | 原始内容 |
-| **附件 URL** | 有时效性的签名 URL | 内部 URL |
+在同一分享链接下，系统根据用户身份状态进行差异化处理：
 
-### 5.2 功能层差异
+| 身份类型 | 定义 | `user` 对象 | `cannot(user, "read", document)` |
+|---------|------|-------------|----------------------------------|
+| **匿名访问** | 未登录用户 | `undefined` | `true`（`isPublic = true`） |
+| **已登录但无权限** | 已登录，但对文档/集合无读取权限 | 存在 | `true`（`isPublic = true`） |
+| **已登录且有权限** | 已登录，且对文档/集合有读取权限 | 存在 | `false`（`isPublic = false`） |
 
-| 功能 | 公开共享视图 | 登录用户视图 |
-|------|-------------|-------------|
-| **编辑能力** | 只读模式 (`readOnly: true`) | 根据权限决定 |
-| **命令栏** | `SharedCommandBar`（受限功能） | 完整 `CommandBar` |
-| **侧边栏** | `SharedSidebar`（仅共享树） | 完整侧边栏 |
-| **协作功能** | 禁用评论、任务、提及 | 根据权限启用 |
-| **品牌展示** | 可能显示 Outline 品牌 | 无 |
-| **嵌入支持** | 可嵌入 iframe（可选） | 不适用 |
+### 5.2 核心决策逻辑
 
-### 5.3 安全层差异
+#### `isPublic` 标志的计算链路
+
+在 `shares.info` 接口（`server/routes/api/shares/shares.ts:87,94`）中，`isPublic` 标志通过以下逻辑决定：
+
+```typescript
+// 关键点 1：登录用户重新加载带成员关系的集合和文档
+if (user) {
+  collection = collection
+    ? await Collection.findByPk(collection.id, { userId: user.id })
+    : null;
+  document = document
+    ? await Document.findByPk(document.id, { userId: user.id })
+    : null;
+}
+
+// 关键点 2：根据用户权限决定 isPublic 标志
+isPublic: cannot(user, "read", collection/document)
+```
+
+#### `cannot` 函数的行为分析
+
+位于 `server/policies/cancan.ts:166`：
+
+```typescript
+public cannot = (
+  performer: Model,
+  action: string,
+  target: Model | null | undefined,
+  options = {}
+) => !this.can(performer, action, target, options);
+```
+
+**三类身份的具体行为**：
+
+1. **匿名访问（`user = undefined`）**：
+   - `cannot(undefined, "read", document)` → `!can(undefined, "read", document)`
+   - `can` 函数中 `performer instanceof model` 对于 `undefined` 返回 `false`
+   - 结果：`can(undefined, ...) = false` → `cannot(undefined, ...) = true`
+   - 最终：`isPublic = true`
+
+2. **已登录但无权限**：
+   - 用户已登录，但 `can(user, "read", document)` 返回 `false`
+   - 可能原因：不在同一团队、没有成员关系、不是集合成员
+   - 结果：`cannot(user, ...) = true` → `isPublic = true`
+
+3. **已登录且有权限**：
+   - 用户已登录，且 `can(user, "read", document)` 返回 `true`
+   - 满足条件：在同一团队、有成员关系、或是集合成员
+   - 结果：`cannot(user, ...) = false` → `isPublic = false`
+
+### 5.3 数据字段差异对比
+
+| 字段 | 匿名访问 | 已登录但无权限 | 已登录且有权限 | 原因说明 |
+|------|---------|---------------|---------------|----------|
+| `createdBy` | ❌ 隐藏 | ❌ 隐藏 | ✅ 完整显示 | 保护用户隐私，仅有权限用户可见 |
+| `updatedBy` | ❌ 隐藏 | ❌ 隐藏 | ✅ 完整显示 | 保护用户隐私，仅有权限用户可见 |
+| `collaboratorIds` | ❌ 隐藏 | ❌ 隐藏 | ✅ 完整显示 | 保护协作者隐私 |
+| `collectionId` | ❌ 隐藏 | ❌ 隐藏 | ✅ 完整显示 | 隐藏内部结构信息 |
+| `parentDocumentId` | ❌ 隐藏 | ❌ 隐藏 | ✅ 完整显示 | 隐藏内部结构信息 |
+| `updatedAt` | ⚠️ 可选隐藏 | ⚠️ 可选隐藏 | ✅ 完整显示 | 取决于 `showLastUpdated` 分享设置 |
+| `tasks` | ❌ 隐藏 | ❌ 隐藏 | ✅ 完整显示 | 内部协作数据 |
+| `templateId` | ❌ 隐藏 | ❌ 隐藏 | ✅ 完整显示 | 内部模板信息 |
+| `insightsEnabled` | ❌ 隐藏 | ❌ 隐藏 | ✅ 完整显示 | 内部设置 |
+| `popularityScore` | ❌ 隐藏 | ❌ 隐藏 | ✅ 完整显示 | 内部统计 |
+| `sourceMetadata` | ❌ 隐藏 | ❌ 隐藏 | ✅ 完整显示 | 可能包含敏感信息 |
+| **文档内容** | 移除评论、重写链接 | 移除评论、重写链接 | 原始内容 | 保护评论隐私，确保链接有效 |
+| **附件 URL** | 有时效性签名 | 有时效性签名 | 内部 URL | 防止未授权访问附件 |
+
+**关键发现**：匿名访问和已登录但无权限的用户在数据字段上的可见性**完全相同**，都处于 `isPublic = true` 的脱敏状态。只有已登录且有读取权限的用户才能看到完整数据。
+
+### 5.4 页面能力差异对比
+
+| 能力 | 匿名访问 | 已登录但无权限 | 已登录且有权限 | 原因说明 |
+|------|---------|---------------|---------------|----------|
+| **编辑能力** | ❌ 只读 | ❌ 只读 | ✅ 根据权限 | 共享页面强制 `readOnly: true` |
+| **命令栏** | `SharedCommandBar` | `SharedCommandBar` | 完整 `CommandBar` | 受限功能集 vs 完整功能 |
+| **侧边栏** | `SharedSidebar` | `SharedSidebar` | 完整侧边栏 | 仅显示共享树 vs 完整导航 |
+| **评论功能** | ❌ 禁用 | ❌ 禁用 | ✅ 根据权限 | 协作功能仅对有权限用户开放 |
+| **任务功能** | ❌ 禁用 | ❌ 禁用 | ✅ 根据权限 | 协作功能仅对有权限用户开放 |
+| **提及功能** | ❌ 禁用 | ❌ 禁用 | ✅ 根据权限 | 协作功能仅对有权限用户开放 |
+| **品牌展示** | ⚠️ 可能显示 | ⚠️ 可能显示 | ❌ 不显示 | 非自定义域名且无用户时显示 |
+| **嵌入支持** | ✅ 可选 | ✅ 可选 | 不适用 | iframe 嵌入控制 |
+| **订阅功能** | ✅ 可选 | ✅ 可选 | 不适用 | 基于 `allowSubscriptions` 设置 |
+
+**代码依据**（`app/scenes/Shared/Document.tsx`）：
+
+```typescript
+function SharedDocument({ document }: Props) {
+  // ...
+  const abilities = useMemo(() => ({}), []);  // 空权限对象
+  const showBranding = !isCustomDomain && !user;  // 品牌展示条件
+  
+  return (
+    <>
+      <DocumentComponent
+        abilities={abilities}    // 空权限
+        document={document}
+        shareId={shareId}
+        tocPosition={tocPosition}
+        readOnly                // 强制只读
+      />
+      {showBranding ? (
+        <Branding href="//www.getoutline.com?ref=sharelink" />
+      ) : null}
+    </>
+  );
+}
+```
+
+### 5.5 为什么同一分享链接下会有不同表现？
+
+#### 设计动机
+
+1. **无缝身份切换体验**：
+   - 用户在匿名访问共享文档后登录，系统应自动识别其权限
+   - 如果用户原本就有该文档的访问权限，应切换到完整功能视图
+   - 不需要用户重新访问原始链接
+
+2. **权限优先级**：
+   - 分享链接提供的是"最低权限访问"
+   - 用户自身的权限（团队成员、集合成员、文档成员）具有更高优先级
+   - 当用户同时拥有分享链接和直接权限时，使用直接权限
+
+3. **数据一致性**：
+   - 登录用户应看到与在团队内部访问相同的数据
+   - 包括用户信息、协作数据、内部结构等
+   - 避免因访问方式不同导致的数据不一致
+
+#### 技术实现要点
+
+1. **双阶段加载**：
+   - 第一阶段：使用 `loadPublicShare` 加载基本共享信息（不依赖用户）
+   - 第二阶段：如果用户已登录，使用 `userId` 重新加载集合和文档
+   - 重新加载的数据包含用户的成员关系信息
+
+2. **权限感知序列化**：
+   - `presentDocument` 和 `presentCollection` 根据 `isPublic` 参数决定输出字段
+   - `isPublic` 由 `cannot(user, "read", document)` 动态计算
+   - 确保数据输出与用户实际权限匹配
+
+3. **前端组件自适应**：
+   - 虽然共享页面使用 `SharedScene` 入口
+   - 但数据字段的完整程度由后端序列化决定
+   - 前端根据返回的数据字段调整 UI 展示
+
+---
+
+## 6. 边界场景处理链路分析
+
+### 6.1 分享撤销处理链路
+
+#### 场景描述
+分享被创建者或管理员撤销后，后续访问应如何处理？
+
+#### 处理链路
+
+**1. 撤销操作执行**（`server/models/Share.ts:255`）：
+
+```typescript
+revoke(ctx: APIContext) {
+  const { user } = ctx.state.auth;
+  this.revokedAt = new Date();    // 设置撤销时间戳
+  this.revokedById = user.id;     // 记录撤销者
+  return this.saveWithCtx(ctx, undefined, { name: "revoke" });
+}
+```
+
+**关键点**：
+- 撤销是**软删除**，通过设置 `revokedAt` 时间戳实现
+- 记录撤销者 ID 用于审计
+
+**2. 访问时的查询过滤**（`server/commands/shareLoader.ts:36`）：
+
+```typescript
+const where: WhereOptions<Share> = {
+  revokedAt: {
+    [Op.is]: null,    // 只查询未撤销的分享
+  },
+  published: true,
+};
+```
+
+**3. 找不到时的错误处理**（`server/commands/shareLoader.ts:71`）：
+
+```typescript
+if (
+  !share ||                        // 包括已撤销的情况
+  !!share.team.suspendedAt ||
+  !!share.collection?.archivedAt ||
+  !!share.document?.archivedAt
+) {
+  throw NotFoundError();           // 抛出 404 错误
+}
+```
+
+**4. SSR 层的异常捕获**（`server/routes/app.ts:256`）：
+
+```typescript
+try {
+  const result = await loadPublicShare({...});
+  // ...
+} catch (_err) {
+  // If the share or document does not exist, return a 404.
+  ctx.status = 404;
+}
+```
+
+#### 完整处理流程图
+
+```
+用户访问分享链接
+        ↓
+┌─────────────────────────────────────┐
+│  shareDomains() 中间件识别域名       │
+│  （自定义域名查找 rootShare）        │
+└─────────────────────────────────────┘
+        ↓
+┌─────────────────────────────────────┐
+│  renderShare() 处理函数              │
+│  调用 loadPublicShare()             │
+└─────────────────────────────────────┘
+        ↓
+┌─────────────────────────────────────┐
+│  loadPublicShare() 查询条件：        │
+│  WHERE revokedAt IS NULL            │
+│    AND published = true             │
+└─────────────────────────────────────┘
+        ↓
+┌─────────────────────────────────────┐
+│  查询结果为空？                      │
+│  （已撤销的分享不会被匹配）          │
+└─────────────────────────────────────┘
+        ↓
+   ┌────┴────┐
+   │         │
+  是        否
+   │         │
+   ↓         ↓
+ throw    正常返回
+NotFoundError  数据
+   │
+   ↓
+ renderShare
+  捕获异常
+   │
+   ↓
+设置 status = 404
+   │
+   ↓
+ 返回 404 页面
+```
+
+#### 设计决策：为什么返回 404 而不是 403？
+
+**安全考虑**：
+- 返回 403（Forbidden）会泄露"该分享链接确实存在，但你没有权限访问"的信息
+- 返回 404（Not Found）不会泄露任何信息，攻击者无法判断：
+  - 链接是否真实存在
+  - 链接是否已被撤销
+  - 链接是否从未发布
+
+**测试验证**（`server/commands/shareLoader.test.ts:323`）：
+
+```typescript
+describe("inactive share when requested with id", () => {
+  it("should throw error when share is not published", async () => {
+    const share = await buildShare({
+      published: false,
+    });
+    await expect(loadPublicShare({ id: share.id })).rejects.toThrow();
+  });
+  // ... 更多测试用例
+});
+```
+
+### 6.2 子文档越权访问处理链路
+
+#### 场景描述
+用户尝试通过修改 URL 中的 `documentSlug` 访问分享范围外的文档。
+
+#### 处理链路
+
+**1. 路由参数解析**（`server/routes/index.ts`）：
+
+```typescript
+router.get("/s/:shareId/doc/:documentSlug", shareDomains(), renderShare);
+```
+
+**2. `loadPublicShare` 中的访问检查**（`server/commands/shareLoader.ts:109`）：
+
+```typescript
+if (documentId && documentId !== share.documentId) {
+  // 访问的不是根文档，需要额外检查
+  
+  // 步骤 1：获取文档（如果不存在直接抛出 404）
+  document = await Document.findByPk(documentId, {
+    rejectOnEmpty: true,
+  });
+
+  // 步骤 2：初始化可访问性判断
+  let isDocumentAccessible = share.documentId === document.id;
+
+  // 步骤 3：如果开启了子文档共享，检查是否在共享树中
+  if (share.includeChildDocuments) {
+    const allIdsInSharedTree = getAllIdsInSharedTree(sharedTree);
+    isDocumentAccessible = allIdsInSharedTree.includes(document.id);
+  }
+
+  // 步骤 4：不可访问则抛出授权错误
+  if (!isDocumentAccessible) {
+    throw AuthorizationError();
+  }
+}
+```
+
+**3. `getAllIdsInSharedTree` 函数**（`server/commands/shareLoader.ts:245`）：
+
+```typescript
+export function getAllIdsInSharedTree(
+  sharedTree: NavigationNode | null
+): string[] {
+  if (!sharedTree) {
+    return [];
+  }
+
+  const ids = [sharedTree.id];
+  for (const child of sharedTree.children) {
+    ids.push(...getAllIdsInSharedTree(child));  // 递归获取所有子节点
+  }
+  return ids;
+}
+```
+
+#### 完整处理流程图
+
+```
+用户访问 /s/:shareId/doc/:targetDocSlug
+        ↓
+┌─────────────────────────────────────┐
+│  解析参数：                           │
+│  shareId = URL 中的分享 ID           │
+│  documentId = 从 slug 解析的文档 ID  │
+└─────────────────────────────────────┘
+        ↓
+┌─────────────────────────────────────┐
+│  loadPublicShare() 执行：           │
+│  1. 查询 Share 记录                  │
+│  2. 检查团队/集合分享设置            │
+│  3. 构建 sharedTree（共享文档树）    │
+└─────────────────────────────────────┘
+        ↓
+┌─────────────────────────────────────┐
+│  documentId !== share.documentId？  │
+│  （访问的不是根文档？）              │
+└─────────────────────────────────────┘
+        ↓
+   ┌────┴────┐
+   │         │
+  是        否
+   │         │
+   ↓         ↓
+ 需要     直接返回
+ 检查      根文档
+   │
+   ↓
+┌─────────────────────────────────────┐
+│  Document.findByPk(documentId)      │
+│  如果文档不存在 → 404               │
+└─────────────────────────────────────┘
+        ↓
+┌─────────────────────────────────────┐
+│  share.includeChildDocuments = ?    │
+│  （是否开启了子文档共享？）          │
+└─────────────────────────────────────┘
+        ↓
+   ┌────┴────┐
+   │         │
+ true     false
+   │         │
+   ↓         ↓
+ 检查      仅允许
+是否在     访问
+共享树中    根文档
+   │         │
+   ↓         ↓
+ 在树中？   documentId
+   │       === share.documentId？
+   ↓            │
+┌──┴──┐       ┌──┴──┐
+│     │       │     │
+是    否      是    否
+│     │       │     │
+↓     ↓       ↓     ↓
+允许  抛出    允许  抛出
+访问 AuthorizationError
+```
+
+#### 测试用例验证（`server/commands/shareLoader.test.ts`）
+
+**用例 1：includeChildDocuments = true 时访问越权文档**：
+```typescript
+it("should throw error when the requested document is not part of the share (includeChildDocuments = true)", async () => {
+  // 创建分享文档 A 和非分享文档 B
+  // 尝试通过分享链接访问文档 B
+  await expect(
+    loadPublicShare({ id: share.id, documentId: anotherDocument.id })
+  ).rejects.toThrow();  // 期望抛出错误
+});
+```
+
+**用例 2：includeChildDocuments = false 时访问子文档**：
+```typescript
+it("should throw error when the child document is requested for a share with includeChildDocuments = false", async () => {
+  // 创建分享文档 A 和其子文档 B
+  // 设置 includeChildDocuments = false
+  // 尝试访问子文档 B
+  await expect(
+    loadPublicShare({ id: share.id, documentId: childDocument.id })
+  ).rejects.toThrow();  // 期望抛出错误
+});
+```
+
+### 6.3 自定义域名异常路径处理链路
+
+#### 场景描述
+用户通过自定义域名访问非预期路径（如 `/settings`、`/api/xxx` 等）。
+
+#### 处理链路
+
+**1. `shareDomains` 中间件**（`server/middlewares/shareDomains.ts`）：
+
+```typescript
+export default function shareDomains() {
+  return async function shareDomainsMiddleware(ctx: Context, next: Next) {
+    const isCustomDomain = parseDomain(ctx.host).custom;
+    
+    if (env.isDevelopment || (isCustomDomain && env.isCloudHosted)) {
+      const share = await Share.unscoped().findOne({
+        where: {
+          domain: ctx.hostname,    // 根据域名查找对应的 Share
+          published: true,
+          revokedAt: { [Op.is]: null },
+        },
+      });
+      ctx.state.rootShare = share;    // 注入到请求上下文
+    }
+    
+    return next();
+  };
+}
+```
+
+**2. 路由优先级处理**（`server/routes/index.ts`）：
+
+```typescript
+// 顺序很重要！shareDomains() 中间件先执行
+router.use(shareDomains());
+
+// 有效路径 1：子文档访问
+router.get("/doc/:documentSlug", async (ctx, next) => {
+  if (ctx.state?.rootShare) {
+    return renderShare(ctx, next);  // 自定义域名下走分享渲染
+  }
+  return next();
+});
+
+// 有效路径 2：站点地图
+router.get("/sitemap.xml", async (ctx) => {
+  if (ctx.state?.rootShare) {
+    ctx.redirect(`/api/shares.sitemap?id=${ctx.state?.rootShare.id}`);
+  } else {
+    ctx.status = 404;
+  }
+});
+
+// Catch-all 路由（最后执行）
+router.get("*", async (ctx, next) => {
+  if (ctx.state?.rootShare) {
+    // 只允许根路径，其他路径返回 404
+    if (ctx.path !== "/") {
+      ctx.status = 404;
+      return;
+    }
+    return renderShare(ctx, next);
+  }
+  // ... 普通域名处理
+});
+```
+
+#### 完整处理流程图
+
+```
+用户通过自定义域名 docs.example.com/xxx 访问
+        ↓
+┌─────────────────────────────────────┐
+│  shareDomains() 中间件执行：         │
+│  1. 检测到是自定义域名               │
+│  2. 查找 domain = docs.example.com   │
+│     且 published = true              │
+│     且 revokedAt IS NULL 的 Share    │
+│  3. 设置 ctx.state.rootShare = share │
+└─────────────────────────────────────┘
+        ↓
+┌─────────────────────────────────────┐
+│  路由匹配（按顺序）：                │
+│  检查请求路径是否匹配已知路由         │
+└─────────────────────────────────────┘
+        ↓
+   ┌────┼────┐
+   │    │    │
+  /doc/:slug  /sitemap.xml  其他路径
+   │    │    │
+   ↓    ↓    ↓
+ 有效  有效  进入
+路径  路径  catch-all
+   │    │    │
+   ↓    ↓    ↓
+renderShare  检查
+          path === "/"？
+               │
+          ┌────┴────┐
+          │         │
+         是        否
+          │         │
+          ↓         ↓
+       renderShare  status=404
+```
+
+#### 自定义域名下的有效路径列表
+
+| 路径 | 处理方式 | 说明 |
+|------|---------|------|
+| `/` | `renderShare` | 根路径，访问共享首页 |
+| `/doc/:documentSlug` | `renderShare` | 访问共享子文档 |
+| `/sitemap.xml` | 重定向到 `/api/shares.sitemap` | 站点地图（SEO） |
+| 其他任意路径 | 返回 404 | 防止未授权访问 |
+
+#### 设计意图
+
+1. **URL 空间隔离**：
+   - 自定义域名的 URL 空间完全受控于分享配置
+   - 不允许访问 `/settings`、`/api`、`/admin` 等内部路径
+   - 防止信息泄露和安全漏洞
+
+2. **简洁的用户体验**：
+   - 访问自定义域名根路径直接进入共享文档
+   - 不需要用户记住复杂的 `/s/:shareId` 路径
+   - 符合品牌化需求
+
+3. **安全边界**：
+   - 自定义域名与主应用域名完全隔离
+   - Cookie 不会跨域名泄露
+   - 防止通过自定义域名访问非共享内容
+
+---
+
+## 7. 差异对比总结
+
+### 7.1 数据层差异
+
+| 维度 | 匿名访问 | 已登录但无权限 | 已登录且有权限 |
+|------|---------|---------------|---------------|
+| **用户信息** | 隐藏 createdBy、updatedBy、collaboratorIds | 隐藏 createdBy、updatedBy、collaboratorIds | 完整显示 |
+| **结构信息** | 隐藏 collectionId、parentDocumentId | 隐藏 collectionId、parentDocumentId | 完整显示 |
+| **时间戳** | 可选隐藏 updatedAt | 可选隐藏 updatedAt | 完整显示 |
+| **协作数据** | 隐藏 tasks、comments | 隐藏 tasks、comments | 完整显示 |
+| **内部设置** | 隐藏 sharing、commenting、permission 等 | 隐藏 sharing、commenting、permission 等 | 完整显示 |
+| **文档内容** | 移除评论标记，重写内部链接 | 移除评论标记，重写内部链接 | 原始内容 |
+| **附件 URL** | 有时效性的签名 URL | 有时效性的签名 URL | 内部 URL |
+
+### 7.2 功能层差异
+
+| 功能 | 匿名访问 | 已登录但无权限 | 已登录且有权限 |
+|------|---------|---------------|---------------|
+| **编辑能力** | 只读模式 (`readOnly: true`) | 只读模式 (`readOnly: true`) | 根据权限决定 |
+| **命令栏** | `SharedCommandBar`（受限功能） | `SharedCommandBar`（受限功能） | 完整 `CommandBar` |
+| **侧边栏** | `SharedSidebar`（仅共享树） | `SharedSidebar`（仅共享树） | 完整侧边栏 |
+| **协作功能** | 禁用评论、任务、提及 | 禁用评论、任务、提及 | 根据权限启用 |
+| **品牌展示** | 可能显示 Outline 品牌 | 可能显示 Outline 品牌 | 不显示 |
+| **嵌入支持** | 可嵌入 iframe（可选） | 可嵌入 iframe（可选） | 不适用 |
+
+### 7.3 安全层差异
 
 | 安全措施 | 公开共享视图 | 登录用户视图 |
 |----------|-------------|-------------|
 | **身份验证** | 可选（通过 `auth({ optional: true })`） | 必需 |
-| **权限检查** | 基于分享链接有效性 | 基于团队/集合/文档权限 |
+| **权限检查** | 基于分享链接有效性 + 用户权限 | 基于团队/集合/文档权限 |
 | **访问范围** | 限制在共享树内 | 根据用户权限决定 |
 | **数据脱敏** | 多级脱敏（用户信息、结构信息、协作数据） | 无 |
 | **URL 签名** | 附件 URL 有时效性签名 | 内部 URL 无签名 |
