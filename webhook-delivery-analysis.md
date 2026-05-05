@@ -22,8 +22,8 @@ Webhook 订阅信息存储在 `WebhookSubscription` 模型中，核心字段包�
 订阅支持灵活的事件匹配：
 
 1. **通配符订阅**：使用 `"*"` 订阅所有事件
-2. **精确匹配**：如 `"users.create"`
-3. **前缀匹配**：如 `"documents."` 匹配所有以该前缀开头的事件
+2. **精确匹配**：如 `"users.create"` 只匹配该具体事件
+3. **前缀匹配**：如 `"documents"` 匹配所有以 `"documents."` 开头的事件（如 `"documents.create"`、`"documents.update"` 等）
 
 **匹配方法**（`WebhookSubscription.validForEvent`）：
 
