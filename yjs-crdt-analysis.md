@@ -925,6 +925,90 @@ Outline 实现了两套独立的 WebSocket 服务：
 // - imports.update
 ```
 
+### 7.2 两套服务的重连机制对比
+
+Outline 的两套 WebSocket 服务采用了完全不同的重连策略：
+
+#### 7.2.1 实时事件服务 (Socket.io) - 指数退避
+
+**配置位置**：`app/components/WebsocketProvider.tsx:789-794`
+
+```typescript
+currentSocket = io(window.location.origin, {
+  path: "/realtime",
+  transports: ["websocket"],
+  reconnectionDelay: 1000,      // 初始延迟 1 秒
+  reconnectionDelayMax: 30000,   // 最大延迟 30 秒
+  withCredentials: true,
+});
+```
+
+**重连行为**：
+- 第 1 次重试：等待 1 秒
+- 第 2 次重试：等待 2 秒（1秒 × 2）
+- 第 3 次重试：等待 4 秒（2秒 × 2）
+- 第 4 次重试：等待 8 秒
+- ...以此类推，直到达到最大 30 秒
+- 公式：`delay = min(initialDelay * 2^(attempts-1), maxDelay)`
+
+#### 7.2.2 协作编辑服务 (Hocuspocus) - 两种场景
+
+**配置位置**：`app/scenes/Document/components/MultiplayerEditor.tsx`
+
+**场景 A：普通网络断线**
+
+```typescript
+// 代码注释: "Note other close code are handled internally by the library"
+provider.on("close", (ev: MessageEvent) => {
+  if ("code" in ev.event) {
+    // 非特定错误码由 Hocuspocus 内部处理
+    if (ev.event.code === EditorUpdateError.code) {
+      provider.shouldConnect = false;
+    }
+    // ...
+  }
+});
+```
+
+- 普通断线由 **Hocuspocus 库内部自动处理**
+- 应用层无自定义退避逻辑
+
+**场景 B：令牌过期 (`authenticationFailed`)**
+
+```typescript
+provider.on("authenticationFailed", () => {
+  provider.shouldConnect = false;
+  retryCount.current++;
+
+  // 线性递增等待时间
+  // 第1次: 1*1000-1000 = 0ms (立即)
+  // 第2次: 2*1000-1000 = 1000ms
+  // 第3次: 3*1000-1000 = 2000ms
+  // 公式: delay = (retryCount - 1) * 1000 ms
+  void sleep(retryCount.current * 1000 - 1000).then(() =>
+    auth.fetchAuth().then(() => {
+      provider.setConfiguration({ token: auth.collaborationToken });
+      provider.connect();
+      provider.shouldConnect = true;
+    })
+  );
+});
+```
+
+- **线性递增等待**：0s, 1s, 2s, 3s, 4s...
+- 同步成功后 `retryCount.current = 0` 重置
+
+#### 7.2.3 对比总结
+
+| 对比项 | 实时事件服务 (Socket.io) | 协作编辑服务 (Hocuspocus) |
+|--------|-------------------------|---------------------------|
+| **技术** | Socket.io | Hocuspocus (原生 WebSocket) |
+| **路径** | `/realtime` | `/collaboration` |
+| **普通断线** | 指数退避 (1s → 2s → 4s → ... → 30s) | 库内部自动处理 |
+| **认证失败** | Socket.io 内置认证机制 | 应用层线性递增 (0s → 1s → 2s → ...) |
+| **重置条件** | 连接成功后重置 | `synced` 事件后重置 `retryCount` |
+| **代码位置** | `app/components/WebsocketProvider.tsx` | `app/scenes/Document/components/MultiplayerEditor.tsx` |
+
 ---
 
 ## 8. 关键设计要点与最佳实践
@@ -948,13 +1032,14 @@ Outline 实现了两套独立的 WebSocket 服务：
 
 ### 8.3 容错处理
 
-| 故障场景 | 处理机制 |
-|----------|----------|
-| 网络中断 | Hocuspocus Provider 自动重连 + 指数退避 |
-| 令牌过期 | authenticationFailed 事件触发刷新 |
-| 编辑器版本不兼容 | EditorVersionExtension 检测并断开 |
-| 数据库锁超时 | 15秒 lock_timeout 防止死锁 |
-| Yjs 编码错误 | 全局错误监听，提示用户刷新 |
+| 故障场景 | 处理机制 | 代码依据 |
+|----------|----------|----------|
+| **协作编辑 - 普通断线** | Hocuspocus 库内部自动重连 | 代码注释："Note other close code are handled internally by the library" |
+| **协作编辑 - 令牌过期** | `authenticationFailed` 事件 → **线性递增等待**（0s, 1s, 2s...）后刷新令牌重连 | `sleep(retryCount.current * 1000 - 1000)` |
+| **实时事件服务 - 任何断线** | Socket.io **指数退避**（1s → 2s → 4s → ... → 最大 30s） | `reconnectionDelay: 1000`, `reconnectionDelayMax: 30000` |
+| 编辑器版本不兼容 | EditorVersionExtension 检测并断开 | 服务端扩展检测 |
+| 数据库锁超时 | 15秒 lock_timeout 防止死锁 | `SET LOCAL lock_timeout = '15s'` |
+| Yjs 编码错误 | 全局错误监听，提示用户刷新 | 全局 error 事件监听 |
 
 ### 8.4 数据一致性保证
 
