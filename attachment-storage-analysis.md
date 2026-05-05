@@ -195,23 +195,543 @@ public store = async ({ body, key }: StoreParams) => {
 
 ---
 
-## 3. 上传入口职责分析
+## 3. 上传入口职责边界深度分析
 
-### 3.1 上传入口概述
+### 3.1 核心概念澄清：上传信息字段分类
 
-Outline 提供三个主要的附件上传入口：
+在深入分析上传流程之前，必须明确一个**关键区分**：预签名返回信息中的字段，哪些是实际使用的，哪些只是辅助信息。
 
-| 入口路由 | 功能描述 | 认证要求 |
-|----------|----------|----------|
-| `attachments.create` | 标准上传入口，返回预签名 URL | 必需 |
-| `attachments.createFromUrl` | 从远程 URL 创建附件 | 必需 |
-| `attachmentCreator` | 程序化创建（命令模式） | 内部调用 |
+#### 3.1.1 服务端返回值组装逻辑
 
-### 3.2 标准上传入口：attachments.create
+**核心文件**：`server/routes/api/attachments/attachments.ts:141-162`
 
-**核心文件**：`server/routes/api/attachments/attachments.ts`
+```typescript
+const presignedPost = await FileStorage.getPresignedPost(
+  ctx,
+  key,
+  acl,
+  maxUploadSize,
+  contentType
+);
 
-#### 3.2.1 中间件配置
+ctx.body = {
+  data: {
+    uploadUrl: FileStorage.getUploadUrl(),           // 字段 A：实际上传端点
+    form: {
+      "Cache-Control": "max-age=31557600",            // 服务端添加的字段
+      "Content-Type": contentType,                     // 服务端添加的字段
+      ...presignedPost.fields,                         // 字段 B：来自 getPresignedPost().fields
+    },
+    attachment: {
+      ...presentAttachment(attachment),
+      url: attachment.redirectUrl,
+    },
+  },
+};
+```
+
+**关键点**：
+- `presignedPost` 包含两个属性：`url` 和 `fields`
+- `presignedPost.url` **没有被使用**
+- `presignedPost.fields` 被**展开合并到 form 中**
+
+#### 3.1.2 客户端实际上传逻辑
+
+**核心文件**：`app/utils/files.ts:123`
+
+```typescript
+// 第 123 行：实际上传
+xhr.open("POST", data.uploadUrl, true);
+xhr.send(formData);
+```
+
+**关键点**：
+- 客户端使用的是 `data.uploadUrl`，**不是** `presignedPost.url`
+- 客户端使用的是 `data.form` 中的字段，这些字段包含了 `presignedPost.fields`
+- `presignedPost.url` 完全没有被直接使用
+
+#### 3.1.3 上传信息字段分类总表
+
+| 字段类别 | 字段名称 | 来源 | 客户端是否使用 | 实际用途 |
+|----------|----------|------|----------------|----------|
+| **实际上传端点** | `uploadUrl` | `FileStorage.getUploadUrl()` | ✅ 实际使用 | 客户端 POST 的目标 URL |
+| **表单验证字段** | `form` | 服务端组装（含 `presignedPost.fields`） | ✅ 实际使用 | S3 或服务端用这些验证上传 |
+| **服务端添加字段** | `Cache-Control`, `Content-Type` | 服务端在返回前添加 | ✅ 实际使用 | 控制缓存和内容类型 |
+| **辅助信息（未使用）** | `presignedPost.url` | `FileStorage.getPresignedPost().url` | ❌ 未直接使用 | 仅为接口兼容，实际不用 |
+| **实际使用的签名字段** | `presignedPost.fields` | `FileStorage.getPresignedPost().fields` | ✅ 实际使用 | 被合并到 form 中 |
+
+---
+
+### 3.2 S3 存储：上传端点与预签名 URL 的关系
+
+#### 3.2.1 S3 相关方法实现
+
+**核心文件**：`server/storage/files/S3Storage.ts`
+
+```typescript
+// 方法 1: getUploadUrl() - 返回实际上传端点
+public getUploadUrl(isServerUpload?: boolean) {
+  return this.getPublicEndpoint(isServerUpload);
+}
+
+private getPublicEndpoint(isServerUpload?: boolean) {
+  if (env.AWS_S3_ACCELERATE_URL) {
+    return env.AWS_S3_ACCELERATE_URL;
+  }
+  // ... 构建 S3 端点 URL
+  return `${host}/${isServerUpload && isDocker ? "s3/" : ""}${
+    env.AWS_S3_UPLOAD_BUCKET_NAME
+  }`;
+}
+
+// 方法 2: getPresignedPost() - 返回预签名信息
+public async getPresignedPost(
+  _ctx: AppContext,
+  key: string,
+  _acl: string,
+  maxUploadSize: number,
+  contentType = "image"
+) {
+  const params: PresignedPostOptions = {
+    Bucket: env.AWS_S3_UPLOAD_BUCKET_NAME as string,
+    Key: key,
+    Conditions: compact([
+      ["content-length-range", 0, maxUploadSize],
+      ["starts-with", "$Content-Type", contentType],
+      ["starts-with", "$Cache-Control", ""],
+    ]),
+    Fields: {
+      "Content-Disposition": this.getContentDisposition(contentType),
+      key,
+      ...(env.AWS_S3_ACL && { ACL: env.AWS_S3_ACL as ObjectCannedACL }),
+    },
+    Expires: 3600,  // 1 小时有效期
+  };
+
+  return createPresignedPost(this.client, params);
+}
+```
+
+#### 3.2.2 AWS createPresignedPost 返回值格式
+
+根据 AWS SDK，`createPresignedPost` 返回：
+
+```typescript
+{
+  url: string;           // S3 端点 URL（如 https://bucket.s3.amazonaws.com）
+  fields: {              // 必须包含的表单字段
+    key: string;                              // 文件存储路径
+    Policy: string;                           // Base64 编码的上传策略
+    "X-Amz-Algorithm": string;                // 签名算法（如 AWS4-HMAC-SHA256）
+    "X-Amz-Credential": string;               // 凭证信息
+    "X-Amz-Date": string;                     // 签名日期
+    "X-Amz-Signature": string;                // HMAC-SHA256 签名
+    "Content-Disposition": string;            // 内容 disposition
+    // ... 其他字段（如 ACL 等）
+  };
+}
+```
+
+#### 3.2.3 S3 存储的关键特点
+
+对于 S3 存储，有一个**重要的巧合**：
+
+```
+getUploadUrl() 返回值 = presignedPost.url 返回值
+```
+
+这两个值都是 S3 端点 URL（如 `https://bucket.s3.amazonaws.com`）。
+
+**为什么是巧合**：
+- AWS `createPresignedPost` 设计上返回的 `url` 就是上传端点
+- Outline 的 `getUploadUrl()` 也是返回 S3 上传端点
+- 所以两者值相同
+
+**实际影响**：
+- 虽然 `presignedPost.url` 没有被直接使用
+- 但它的值与 `uploadUrl` 相同
+- 这导致在 S3 场景下，即使错误地使用 `presignedPost.url`，也能正常工作
+
+#### 3.2.4 S3 上传完整流程
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           S3 上传完整流程                                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  1. 客户端请求 POST /api/attachments.create                                  │
+│     ├── preset: DocumentAttachment                                           │
+│     ├── documentId: doc-123                                                  │
+│     ├── name: screenshot.png                                                 │
+│     ├── contentType: image/png                                               │
+│     └── size: 102400                                                         │
+│                                    ↓                                          │
+│  2. 服务端处理                                                                │
+│     ├── 权限检查（auth + authorize）                                          │
+│     ├── 创建 Attachment 记录                                                  │
+│     │   ├── id: att-456                                                      │
+│     │   ├── key: uploads/user-789/att-456/screenshot.png                   │
+│     │   └── acl: private                                                      │
+│     │                                                                         │
+│     ├── 调用 FileStorage.getUploadUrl()                                      │
+│     │   └── 返回: "https://my-bucket.s3.us-east-1.amazonaws.com"            │
+│     │                                                                         │
+│     └── 调用 FileStorage.getPresignedPost()                                  │
+│         └── 返回: {                                                           │
+│               url: "https://my-bucket.s3.us-east-1.amazonaws.com",          │
+│               // ⚠️  注意：这个 url 与 uploadUrl 相同，但**未被直接使用**     │
+│               fields: {                                                       │
+│                 key: "uploads/user-789/att-456/screenshot.png",             │
+│                 Policy: "eyJleHBpcmF0aW9uIjoiMjAyNi0wNS0wNVQxO...",       │
+│                 "X-Amz-Algorithm": "AWS4-HMAC-SHA256",                      │
+│                 "X-Amz-Credential": "AKIA.../us-east-1/s3/aws4_request",   │
+│                 "X-Amz-Date": "20260505T120000Z",                           │
+│                 "X-Amz-Signature": "a1b2c3d4e5f6...",                       │
+│                 "Content-Disposition": "inline",                              │
+│               }                                                               │
+│             }                                                                 │
+│                                    ↓                                          │
+│  3. 服务端返回（关键！）                                                        │
+│     {                                                                         │
+│       data: {                                                                 │
+│         uploadUrl: "https://my-bucket.s3.us-east-1.amazonaws.com",           │
+│         // ✅  实际上传端点 - 来自 getUploadUrl()                              │
+│         // ⚠️  presignedPost.url 没有被直接使用！                              │
+│                                                                               │
+│         form: {                                                               │
+│           "Cache-Control": "max-age=31557600",                              │
+│           "Content-Type": "image/png",                                        │
+│           key: "uploads/user-789/att-456/screenshot.png",                   │
+│           Policy: "eyJleHBpcmF0aW9uIjoiMjAyNi0wNS0wNVQxO...",               │
+│           "X-Amz-Algorithm": "AWS4-HMAC-SHA256",                            │
+│           "X-Amz-Credential": "AKIA.../us-east-1/s3/aws4_request",         │
+│           "X-Amz-Date": "20260505T120000Z",                                 │
+│           "X-Amz-Signature": "a1b2c3d4e5f6...",                             │
+│           "Content-Disposition": "inline",                                    │
+│           // ✅  form 包含 presignedPost.fields 的所有内容                    │
+│         },                                                                     │
+│         attachment: { ... }                                                   │
+│       }                                                                       │
+│     }                                                                         │
+│                                    ↓                                          │
+│  4. 客户端实际上传                                                            │
+│     ├── 构建 FormData                                                         │
+│     │   ├── 遍历 data.form 的所有键值对                                       │
+│     │   └── 添加 file 字段                                                    │
+│     │                                                                         │
+│     └── 发送 POST 请求到 data.uploadUrl                                       │
+│         POST https://my-bucket.s3.us-east-1.amazonaws.com                   │
+│         Content-Type: multipart/form-data                                    │
+│                                                                               │
+│         Body:                                                                 │
+│         ------WebKitFormBoundary                                              │
+│         Content-Disposition: form-data; name="Cache-Control"                │
+│         max-age=31557600                                                      │
+│                                                                               │
+│         ------WebKitFormBoundary                                              │
+│         Content-Disposition: form-data; name="key"                          │
+│         uploads/user-789/att-456/screenshot.png                             │
+│                                                                               │
+│         ------WebKitFormBoundary                                              │
+│         Content-Disposition: form-data; name="Policy"                       │
+│         eyJleHBpcmF0aW9uIjoiMjAyNi0wNS0wNVQxO...                            │
+│                                                                               │
+│         ------WebKitFormBoundary                                              │
+│         Content-Disposition: form-data; name="X-Amz-Signature"             │
+│         a1b2c3d4e5f6...                                                       │
+│                                                                               │
+│         ------WebKitFormBoundary                                              │
+│         Content-Disposition: form-data; name="file"; filename="screenshot.png"│
+│         Content-Type: image/png                                               │
+│                                                                               │
+│         [二进制文件内容]                                                        │
+│         ------WebKitFormBoundary--                                            │
+│                                    ↓                                          │
+│  5. S3 验证签名并存储文件                                                      │
+│     ├── S3 验证 Policy 和 X-Amz-Signature                                    │
+│     ├── 检查上传条件（文件大小、Content-Type 等）                              │
+│     └── 存储文件到指定 key                                                     │
+│                                                                               │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 3.2.5 S3 上传关键信息对照表
+
+| 信息项 | 来源 | 实际用途 | 说明 |
+|--------|------|----------|------|
+| **uploadUrl** | `getUploadUrl()` | 实际上传端点 | 客户端向此 URL 发送 POST |
+| **presignedPost.url** | `getPresignedPost().url` | **未直接使用** | 与 uploadUrl 值相同（都是 S3 端点） |
+| **form 中的签名字段** | `presignedPost.fields` | **核心验证信息** | S3 用这些字段验证上传合法性 |
+
+**关键点**：
+- 对于 S3，`getUploadUrl()` 和 `presignedPost.url` 返回的是同一个值
+- 但 `presignedPost.url` 没有被直接使用，客户端使用的是 `uploadUrl`
+- 真正重要的是 `presignedPost.fields` 中的签名信息，这些被合并到 `form` 中
+
+---
+
+### 3.3 本地存储：上传端点与预签名 URL 的显著差异
+
+#### 3.3.1 本地存储相关方法实现
+
+**核心文件**：`server/storage/files/LocalStorage.ts`
+
+```typescript
+// 方法 1: getUploadUrl() - 返回实际上传端点
+public getUploadUrl() {
+  return "/api/files.create";
+}
+
+// 方法 2: getPresignedPost() - 返回模拟的预签名信息
+public async getPresignedPost(
+  ctx: AppContext,
+  key: string,
+  acl: string,
+  maxUploadSize: number,
+  contentType = "image"
+): Promise<Partial<PresignedPost>> {
+  return Promise.resolve({
+    url: this.getUrlForKey(key),                      // ⚠️  注意：这是 /api/files.get?key=...
+    fields: {
+      key,
+      acl,
+      maxUploadSize: String(maxUploadSize),
+      contentType,
+      [CSRF.fieldName]: ctx.cookies.get(CSRF.cookieName) || "",  // CSRF Token
+    },
+  });
+}
+
+// 方法 3: getUrlForKey() - 返回文件访问 URL（不是上传 URL！）
+public getUrlForKey(key: string): string {
+  return `/api/files.get?key=${key}`;
+}
+```
+
+#### 3.3.2 本地存储的关键差异
+
+对于本地存储，有一个**显著的差异**：
+
+```
+getUploadUrl() 返回值 ≠ presignedPost.url 返回值
+```
+
+具体来说：
+- `getUploadUrl()` → `/api/files.create`（**上传端点**）
+- `presignedPost.url` → `/api/files.get?key=...`（**访问/下载端点**）
+
+**为什么有差异**：
+- 本地存储是为了**模拟** S3 的接口
+- `getPresignedPost()` 中的 `url` 字段被错误地设置为了文件访问 URL（`getUrlForKey()`）
+- 而 `getUploadUrl()` 正确地返回了上传端点
+
+**实际影响**：
+- `presignedPost.url` 完全没有被使用
+- 如果错误地使用 `presignedPost.url` 作为上传端点，会导致上传失败
+- 客户端必须使用 `uploadUrl`
+
+#### 3.3.3 本地存储上传完整流程
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        本地存储上传完整流程                                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  1. 客户端请求 POST /api/attachments.create                                  │
+│                                    ↓                                          │
+│  2. 服务端处理                                                                │
+│     ├── 权限检查（auth + authorize）                                          │
+│     ├── 创建 Attachment 记录                                                  │
+│     │   ├── id: att-456                                                      │
+│     │   ├── key: uploads/user-789/att-456/screenshot.png                   │
+│     │   └── acl: private                                                      │
+│     │                                                                         │
+│     ├── 调用 FileStorage.getUploadUrl()                                      │
+│     │   └── 返回: "/api/files.create"  ← ✅ 实际上传端点                      │
+│     │                                                                         │
+│     └── 调用 FileStorage.getPresignedPost()                                  │
+│         └── 返回: {                                                           │
+│               url: "/api/files.get?key=uploads/user-789/att-456/screenshot.png",│
+│               // ⚠️  关键差异：这个 url 是文件访问 URL，不是上传 URL！        │
+│               // ⚠️  这个 url 实际上**没有被使用**！                           │
+│                                                                               │
+│               fields: {                                                       │
+│                 key: "uploads/user-789/att-456/screenshot.png",             │
+│                 acl: "private",                                               │
+│                 maxUploadSize: "10485760",                                   │
+│                 contentType: "image/png",                                      │
+│                 "x-csrf-token": "abc123xyz",  ← CSRF Token                  │
+│               }                                                               │
+│             }                                                                 │
+│                                    ↓                                          │
+│  3. 服务端返回（关键！）                                                        │
+│     {                                                                         │
+│       data: {                                                                 │
+│         uploadUrl: "/api/files.create",  ← ✅ 来自 getUploadUrl()             │
+│                                                                               │
+│         form: {                                                               │
+│           "Cache-Control": "max-age=31557600",                              │
+│           "Content-Type": "image/png",                                        │
+│           key: "uploads/user-789/att-456/screenshot.png",                   │
+│           acl: "private",                                                      │
+│           maxUploadSize: "10485760",                                          │
+│           contentType: "image/png",                                            │
+│           "x-csrf-token": "abc123xyz",                                         │
+│           // ⚠️  presignedPost.url 没有出现在这里！                           │
+│           // ✅  form 包含 presignedPost.fields 的所有内容                    │
+│         },                                                                     │
+│         attachment: { ... }                                                   │
+│       }                                                                       │
+│     }                                                                         │
+│                                    ↓                                          │
+│  4. 客户端实际上传                                                            │
+│     ├── 构建 FormData（包含 form 中的所有字段 + file）                        │
+│     │                                                                         │
+│     └── 发送 POST 请求到 data.uploadUrl                                       │
+│         POST /api/files.create                                                │
+│         Cookie: ...（包含 CSRF Cookie）                                        │
+│         Content-Type: multipart/form-data                                    │
+│                                                                               │
+│         Body:                                                                 │
+│         ------WebKitFormBoundary                                              │
+│         Content-Disposition: form-data; name="key"                          │
+│         uploads/user-789/att-456/screenshot.png                             │
+│                                                                               │
+│         ------WebKitFormBoundary                                              │
+│         Content-Disposition: form-data; name="x-csrf-token"                 │
+│         abc123xyz                                                              │
+│                                                                               │
+│         ------WebKitFormBoundary                                              │
+│         Content-Disposition: form-data; name="file"; filename="screenshot.png"│
+│         Content-Type: image/png                                               │
+│                                                                               │
+│         [二进制文件内容]                                                        │
+│         ------WebKitFormBoundary--                                            │
+│                                                                               │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 3.3.4 本地存储上传关键信息对照表
+
+| 信息项 | 来源 | 实际用途 | 说明 |
+|--------|------|----------|------|
+| **uploadUrl** | `getUploadUrl()` | 实际上传端点 | 客户端向此 URL 发送 POST |
+| **presignedPost.url** | `getPresignedPost().url` | **完全未使用** | 返回的是 `/api/files.get?key=...`（访问 URL），不是上传 URL |
+| **form 中的字段** | `presignedPost.fields` | **辅助验证信息** | 包含 key、acl、maxUploadSize、contentType、CSRF token |
+
+**关键点**：
+- 对于本地存储，`getUploadUrl()` 返回 `/api/files.create`，而 `presignedPost.url` 返回 `/api/files.get?key=...`
+- 这两个 URL 是**完全不同**的！
+- `presignedPost.url` 完全没有被使用
+- `presignedPost.fields` 中的 CSRF token 是本地存储的安全验证机制
+- 注意：`/api/files.create` 路由在当前代码中似乎不存在，这可能是一个待实现的功能或设计问题
+
+---
+
+### 3.4 S3 与本地存储上传机制差异对照表
+
+这是本报告的核心对比表格，清晰展示两种存储后端在上传机制上的差异：
+
+| 对比项 | S3 存储 | 本地存储 | 差异说明 |
+|--------|----------|----------|----------|
+| **实际上传端点** | `getUploadUrl()` → S3 端点 URL | `getUploadUrl()` → `/api/files.create` | S3 直接上传到 AWS，本地存储上传到 Outline 服务端 |
+| **presignedPost.url 值** | 与 `uploadUrl` **相同**（S3 端点） | 与 `uploadUrl` **不同**（`/api/files.get?key=...`） | **这是最关键的差异** |
+| **presignedPost.url 含义** | 上传端点 URL | 访问/下载端点 URL | S3 的 presignedPost.url 是上传端点，本地存储的 presignedPost.url 是访问 URL |
+| **presignedPost.url 是否使用** | 未直接使用（但值与 uploadUrl 相同） | **完全未使用** | 两种存储的 presignedPost.url 都未被直接使用 |
+| **核心验证机制** | AWS 签名（`Policy` + `X-Amz-Signature`） | CSRF Token | S3 使用 AWS Signature V4，本地存储使用简单的 CSRF 验证 |
+| **fields 包含内容** | `key`, `Policy`, `X-Amz-*`, `Content-Disposition`, `ACL` | `key`, `acl`, `maxUploadSize`, `contentType`, `x-csrf-token` | S3 的 fields 包含复杂的签名信息，本地存储的 fields 相对简单 |
+| **上传目标** | 直接上传到 S3 服务 | 上传到 Outline 服务端 | S3 是云服务，本地存储通过 Outline 服务中转 |
+| **签名有效期** | 3600 秒（1 小时） | 无（CSRF token 有效期由 Cookie 决定） | S3 的签名有明确有效期，本地存储依赖 CSRF Cookie |
+| **接口兼容性** | `getUploadUrl()` 和 `presignedPost.url` 可互换 | `getUploadUrl()` 和 `presignedPost.url` 不可互换 | S3 场景下即使误用 presignedPost.url 也能工作，本地存储则不行 |
+
+---
+
+### 3.5 上传入口职责边界总结
+
+#### 3.5.1 核心职责划分
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        上传入口职责边界                                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  attachments.create 接口的职责：                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  1. 权限检查                                                           │   │
+│  │     - 验证用户身份（必需认证）                                          │   │
+│  │     - 检查文档更新权限（如果有 documentId）                              │   │
+│  │     - 检查团队附件创建权限                                               │   │
+│  │                                                                         │   │
+│  │  2. 创建附件元数据                                                       │   │
+│  │     - 生成 UUID 作为附件 ID                                              │   │
+│  │     - 生成存储路径 key                                                   │   │
+│  │     - 确定 ACL（访问控制列表）                                           │   │
+│  │     - 插入数据库记录                                                      │   │
+│  │                                                                         │   │
+│  │  3. 生成上传凭证（核心！）                                                │   │
+│  │     - ✅ uploadUrl: 实际上传端点（来自 getUploadUrl()）                  │   │
+│  │     - ✅ form: 必须包含的表单字段（含 presignedPost.fields）             │   │
+│  │     - ❌ presignedPost.url: 辅助信息，未直接使用                         │   │
+│  │                                                                         │   │
+│  │  4. 返回上传信息                                                         │   │
+│  │     - uploadUrl                                                         │   │
+│  │     - form                                                              │   │
+│  │     - attachment（含 redirectUrl 用于后续访问）                           │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  ⚠️  重要澄清：presignedPost 返回值的实际用途                                 │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │                                                                         │   │
+│  │  presignedPost = {                                                      │   │
+│  │    url: "...",      ← ⚠️  这个字段**没有被直接使用**！                  │   │
+│  │    fields: { ... }  ← ✅  这些字段**被合并到 form 中实际使用**          │   │
+│  │  }                                                                      │   │
+│  │                                                                         │   │
+│  │  客户端实际使用的是：                                                    │   │
+│  │  - ✅ uploadUrl（来自 FileStorage.getUploadUrl()）                       │   │
+│  │  - ✅ form（包含 presignedPost.fields）                                  │   │
+│  │  - ❌ presignedPost.url（未直接使用）                                     │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 3.5.2 上传信息字段分类（最终版）
+
+| 字段类别 | 字段名称 | 来源 | 是否必需 | 实际用途 |
+|----------|----------|------|----------|----------|
+| **实际上传端点** | `uploadUrl` | `getUploadUrl()` | ✅ 必需 | 客户端 POST 的目标 URL |
+| **签名/验证字段** | `form`（含 `presignedPost.fields`） | 服务端组装 | ✅ 必需 | S3 或服务端用这些验证上传 |
+| **服务端添加字段** | `Cache-Control`, `Content-Type` | 服务端在返回前添加 | ✅ 必需 | 控制缓存和内容类型 |
+| **辅助信息（未使用）** | `presignedPost.url` | `getPresignedPost().url` | ❌ 未使用 | 仅为接口兼容，实际不用 |
+
+#### 3.5.3 为什么 presignedPost.url 未被使用？
+
+这是一个有趣的设计决策，有以下几种可能的原因：
+
+1. **接口兼容考虑**：
+   - Outline 使用 `BaseStorage` 抽象层统一 S3 和本地存储接口
+   - `getPresignedPost()` 是 S3 风格的接口
+   - `presignedPost.url` 是为了保持与 AWS SDK 接口的兼容性
+
+2. **实际使用更清晰**：
+   - `uploadUrl` 明确表示"上传端点"
+   - `form` 明确表示"表单字段"
+   - 这种分离比使用 `presignedPost.url` 更清晰
+
+3. **本地存储的特殊性**：
+   - 对于本地存储，`presignedPost.url` 甚至不是上传端点
+   - 使用独立的 `uploadUrl` 避免了混淆
+
+4. **历史原因**：
+   - 可能早期版本使用过 `presignedPost.url`
+   - 后来改为使用 `uploadUrl`，但保留了 `presignedPost.url` 以保持兼容性
+
+---
+
+### 3.6 标准上传入口：attachments.create（权限检查）
+
+#### 3.6.1 中间件配置
 
 ```typescript
 router.post(
@@ -226,7 +746,7 @@ router.post(
 );
 ```
 
-#### 3.2.2 权限检查策略（严格）
+#### 3.6.2 权限检查策略（严格）
 
 上传入口采用**严格的权限检查策略**，根据 `preset` 类型进行不同的验证：
 
@@ -259,7 +779,7 @@ if (preset === AttachmentPreset.Avatar) {
 }
 ```
 
-#### 3.2.3 权限检查矩阵
+#### 3.6.3 权限检查矩阵
 
 | Preset 类型 | documentId | 权限检查 | 说明 |
 |-------------|------------|----------|------|
@@ -269,45 +789,7 @@ if (preset === AttachmentPreset.Avatar) {
 | `Emoji` | 忽略 | 验证 content-type + `createAttachment` | 团队成员可上传表情 |
 | `Import`/其他 | 忽略 | `createAttachment` 团队权限 | 团队成员可上传 |
 
-#### 3.2.4 上传流程
-
-```
-1. 客户端请求 POST /api/attachments.create
-   ├── preset: AttachmentPreset
-   ├── documentId?: string
-   ├── name: string
-   ├── contentType: string
-   └── size: number
-   ↓
-2. 服务端权限验证
-   ├── 验证用户身份（auth()）
-   ├── 根据 preset 检查权限
-   │   ├── Avatar: 仅验证 content-type
-   │   ├── DocumentAttachment + documentId: 检查文档 update 权限
-   │   └── 其他: 检查 createAttachment 团队权限
-   └── 验证文件大小
-   ↓
-3. 创建 Attachment 数据库记录
-   ├── id: UUID
-   ├── key: uploads/{userId}/{id}/{name}
-   ├── acl: 根据 preset 确定
-   ├── documentId: 可选关联
-   ├── teamId: 用户所属团队
-   └── userId: 上传者 ID
-   ↓
-4. 生成预签名 POST 信息
-   └── FileStorage.getPresignedPost(ctx, key, acl, maxUploadSize, contentType)
-   ↓
-5. 返回上传信息
-   ├── uploadUrl: 存储后端上传 URL
-   ├── form: 表单字段（包含签名）
-   └── attachment: 附件信息（含 redirectUrl）
-   ↓
-6. 客户端直接向存储后端上传文件
-   └── 使用 uploadUrl 和 form 字段
-```
-
-#### 3.2.5 ACL 设置
+#### 3.6.4 ACL 设置
 
 ```typescript
 // server/models/helpers/AttachmentHelper.ts
@@ -325,7 +807,7 @@ static presetToAcl(preset: AttachmentPreset) {
 - 头像预设强制使用 `public-read` ACL
 - 其他预设使用 `AWS_S3_ACL` 环境变量（通常是 `private`）
 
-### 3.3 从 URL 创建入口：attachments.createFromUrl
+### 3.7 从 URL 创建入口：attachments.createFromUrl
 
 ```typescript
 router.post(
@@ -333,7 +815,7 @@ router.post(
   rateLimiter(RateLimiterStrategy.TwentyFivePerMinute),
   auth(),
   validate(T.AttachmentsCreateFromUrlSchema),
-  async (ctx: APIContext<T.AttachmentCreateFromUrlReq>) => {
+  async (ctx: APIContext<T.AttachmentsCreateFromUrlReq>) => {
     const { id, url, documentId, preset } = ctx.input.body;
 
     // 仅支持文档附件类型且必须有 documentId
@@ -369,7 +851,7 @@ router.post(
 - 使用后台任务异步下载
 - 同步等待任务完成后返回
 
-### 3.4 程序化创建：attachmentCreator
+### 3.8 程序化创建：attachmentCreator
 
 **核心文件**：`server/commands/attachmentCreator.ts`
 
@@ -470,8 +952,12 @@ const handleAttachmentsRedirect = async (
 
   // 更新最后访问时间
   await attachment.update(
-    { lastAccessedAt: new Date() },
-    { silent: true }
+    {
+      lastAccessedAt: new Date(),
+    },
+    {
+      silent: true,
+    }
   );
 
   // 根据存储位置决定重定向方式
@@ -490,7 +976,7 @@ const handleAttachmentsRedirect = async (
 
 ### 4.3 权限检查逻辑详解
 
-让我们拆解权限检查的条件：
+让我拆解权限检查的条件：
 
 ```typescript
 if (attachment.isPrivate && attachment.teamId !== user?.teamId) {
@@ -548,6 +1034,8 @@ Outline 的附件权限系统有**两个独立的维度**，它们控制不同�
 |------|----------|----------|
 | **ACL 维度 (isPrivate)** | `acl` 字段值 | **逻辑访问权限**（是否需要检查团队归属） |
 | **存储位置维度 (isStoredInPublicBucket)** | `key` 的前缀 | **缓存策略和 URL 类型** |
+
+**重要声明**：这两个维度是**完全独立**的，**存储位置维度不影响访问权限**。
 
 ### 5.2 ACL 维度详解
 
@@ -799,40 +1287,40 @@ if (attachment.isPrivate && attachment.teamId !== user?.teamId) {
 虽然附件在团队内共享，但仍有明确的安全边界：
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                      安全边界                                │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  Team A                                                    │
-│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐   │
-│  │  Document 1 │    │  Document 2 │    │  Attachment │   │
-│  │  (私有)     │    │  (公开)     │    │  (私有)     │   │
-│  └──────┬──────┘    └──────┬──────┘    └──────┬──────┘   │
-│         │                  │                  │            │
-│         └──────────────────┼──────────────────┘            │
-│                            │                               │
-│                     ┌──────┴──────┐                        │
-│                     │  User A     │                        │
-│                     │  (Team A)   │ ◄── 可以访问所有附件    │
-│                     └─────────────┘                        │
-│                                                             │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  Team B                                                    │
-│  ┌─────────────┐                                           │
-│  │  User B     │ ◄── 无法访问 Team A 的私有附件            │
-│  │  (Team B)   │     (403 AuthorizationError)             │
-│  └─────────────┘                                           │
-│                                                             │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  未登录用户                                                 │
-│  ┌─────────────┐                                           │
-│  │             │ ◄── 无法访问私有附件                       │
-│  │             │     但可以访问 public-read 附件           │
-│  └─────────────┘                                           │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              安全边界                                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  Team A                                                                      │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐                     │
+│  │  Document 1 │    │  Document 2 │    │  Attachment │                     │
+│  │  (私有)     │    │  (公开)     │    │  (私有)     │                     │
+│  └──────┬──────┘    └──────┬──────┘    └──────┬──────┘                     │
+│         │                  │                  │                              │
+│         └──────────────────┼──────────────────┘                              │
+│                            │                                                 │
+│                     ┌──────┴──────┐                                          │
+│                     │  User A     │                                          │
+│                     │  (Team A)   │ ◄── 可以访问所有附件                     │
+│                     └─────────────┘                                          │
+│                                                                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  Team B                                                                      │
+│  ┌─────────────┐                                                             │
+│  │  User B     │ ◄── 无法访问 Team A 的私有附件                              │
+│  │  (Team B)   │     (403 AuthorizationError)                               │
+│  └─────────────┘                                                             │
+│                                                                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  未登录用户                                                                   │
+│  ┌─────────────┐                                                             │
+│  │             │ ◄── 无法访问私有附件                                          │
+│  │             │     但可以访问 public-read 附件                               │
+│  └─────────────┘                                                             │
+│                                                                               │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -992,7 +1480,7 @@ public getSignedUrl = async (
 
 1. **标准上传流程**（attachments.create）：
    - 创建 Attachment 记录
-   - 生成预签名 URL
+   - 生成上传信息（uploadUrl + form）
    - 客户端直接上传到存储后端
 
 2. **从 URL 创建**（attachments.createFromUrl）：
@@ -1116,160 +1604,4 @@ public getContentDisposition(contentType?: string) {
 
   if (
     FileHelper.isAudio(contentType) ||
-    FileHelper.isVideo(contentType) ||
-    this.safeInlineContentTypes.includes(contentType)
-  ) {
-    return "inline";  // 安全类型可以内联显示
-  }
-
-  return "attachment";  // 其他类型作为附件下载
-}
-
-protected safeInlineContentTypes = [
-  "application/pdf",
-  "image/png",
-  "image/jpeg",
-  "image/gif",
-  "image/webp",
-];
-```
-
-**注意**：SVG 被故意排除，因为 SVG 文件可以包含 JavaScript，存在安全风险。
-
-### 8.4 速率限制
-
-附件创建接口有速率限制：
-```typescript
-// server/routes/api/attachments/attachments.ts
-router.post(
-  "attachments.create",
-  rateLimiter(RateLimiterStrategy.TwentyFivePerMinute),  // 每分钟 25 次
-  // ...
-);
-```
-
-### 8.5 公开附件的安全考虑
-
-由于 `public-read` 附件可以被任何人访问，使用时需要注意：
-
-| 风险 | 说明 | 缓解措施 |
-|------|------|----------|
-| 敏感信息泄露 | 如果上传了敏感文件到公开附件 | 默认使用 `private` ACL |
-| 未授权访问 | 未登录用户可以访问 | 仅对头像等必需场景使用 `public-read` |
-| 链接分享 | 知道 URL 就可以访问 | 私有附件使用团队级权限控制 |
-
----
-
-## 9. 关键设计决策总结
-
-### 9.1 存储架构
-
-| 决策 | 说明 |
-|------|------|
-| 双存储后端支持 | S3 用于生产，本地存储用于开发 |
-| 抽象接口设计 | BaseStorage 统一接口，便于扩展其他存储后端 |
-| Bucket 前缀分层 | `uploads/`、`public/`、`avatars/` 用于不同场景 |
-
-### 9.2 入口职责分离
-
-| 入口 | 职责 | 权限策略 |
-|------|------|----------|
-| **上传入口** | 创建附件记录，生成上传凭证 | **严格**：认证必需，检查文档/团队权限 |
-| **下载入口** | 验证访问权限，重定向到实际 URL | **宽松**：认证可选，仅检查 ACL 和团队归属 |
-
-### 9.3 权限模型
-
-| 决策 | 说明 |
-|------|------|
-| **ACL 维度** | `private` 需要团队归属检查，`public-read` 完全公开 |
-| **存储位置维度** | 仅影响缓存策略和 URL 类型，不影响访问权限 |
-| **工作区所有权** | 附件属于 team，而非 document |
-| **团队内共享** | 同一团队成员可访问所有私有附件 |
-| **上传时检查文档权限** | 防止未授权用户上传附件到文档 |
-| **下载时不检查文档权限** | 附件独立于文档存在，简化权限模型 |
-
-### 9.4 安全策略
-
-| 决策 | 说明 |
-|------|------|
-| 签名 URL 模式 | 私有附件通过 API 端点验证后重定向到签名 URL |
-| 路径遍历防护 | 多层验证：ValidateKey.sanitize + safeResolvePath |
-| 内容类型限制 | SVG 等危险类型不作为内联内容显示 |
-| 速率限制 | 防止滥用上传接口 |
-
----
-
-## 10. 代码索引
-
-| 功能模块 | 文件路径 | 关键行号 |
-|----------|----------|----------|
-| 附件模型 | `server/models/Attachment.ts` | 全文 |
-| S3 存储 | `server/storage/files/S3Storage.ts` | 全文 |
-| 本地存储 | `server/storage/files/LocalStorage.ts` | 全文 |
-| 存储基类 | `server/storage/files/BaseStorage.ts` | 全文 |
-| 存储工厂 | `server/storage/files/index.ts` | 1-8 |
-| 附件路由 | `server/routes/api/attachments/attachments.ts` | 全文 |
-| 附件策略 | `server/policies/attachment.ts` | 全文 |
-| 附件助手 | `server/models/helpers/AttachmentHelper.ts` | 全文 |
-| 附件创建命令 | `server/commands/attachmentCreator.ts` | 全文 |
-| MCP 附件工具 | `server/tools/attachments.ts` | 全文 |
-| 附件测试 | `server/routes/api/attachments/attachments.test.ts` | 全文 |
-
----
-
-## 11. 环境变量配置参考
-
-### 11.1 通用配置
-
-| 变量名 | 说明 | 默认值 |
-|--------|------|--------|
-| `FILE_STORAGE` | 存储类型：`local` 或 `s3` | `s3` |
-| `SECRET_KEY` | JWT 签名密钥（本地存储签名 URL） | 必需 |
-| `URL` | 应用 URL（本地存储签名 URL） | 必需 |
-
-### 11.2 S3 配置
-
-| 变量名 | 说明 |
-|--------|------|
-| `AWS_REGION` | S3 区域 |
-| `AWS_S3_UPLOAD_BUCKET_NAME` | 存储桶名称 |
-| `AWS_S3_UPLOAD_BUCKET_URL` | 存储桶访问 URL |
-| `AWS_S3_ACCELERATE_URL` | S3 Transfer Acceleration URL（可选） |
-| `AWS_S3_FORCE_PATH_STYLE` | 使用路径风格访问（boolean） |
-| `AWS_S3_ACL` | 默认 ACL：`private` 或 `public-read` |
-| `AWS_ACCESS_KEY_ID` | AWS 访问密钥 ID |
-| `AWS_SECRET_ACCESS_KEY` | AWS 秘密访问密钥 |
-
-### 11.3 本地存储配置
-
-| 变量名 | 说明 |
-|--------|------|
-| `FILE_STORAGE_LOCAL_ROOT_DIR` | 本地存储根目录 |
-
-### 11.4 上传限制
-
-| 变量名 | 说明 | 默认值 |
-|--------|------|--------|
-| `FILE_STORAGE_UPLOAD_MAX_SIZE` | 普通附件最大大小 |  |
-| `FILE_STORAGE_IMPORT_MAX_SIZE` | 导入文件最大大小 |  |
-| `FILE_STORAGE_WORKSPACE_IMPORT_MAX_SIZE` | 工作区导入最大大小 |  |
-
----
-
-## 附录：Preset 类型说明
-
-```typescript
-// @shared/types
-enum AttachmentPreset {
-  Avatar,             // 用户/团队头像 → ACL: public-read
-  DocumentAttachment, // 文档附件 → ACL: 由 AWS_S3_ACL 决定
-  Emoji,              // 自定义表情 → ACL: 由 AWS_S3_ACL 决定
-  Import,             // 导入临时文件 → ACL: 由 AWS_S3_ACL 决定, 24h 过期
-  WorkspaceImport,    // 工作区导入 → ACL: 由 AWS_S3_ACL 决定, 24h 过期
-}
-```
-
----
-
-**报告生成时间**：2026-05-05
-**分析基于代码版本**：当前工作目录
+    FileHelper.is
