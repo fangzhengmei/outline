@@ -1107,4 +1107,844 @@ it("should handle large groups with batching", async () => {
 
 ---
 
+## 10. 通知交付通道：实时推送与邮件
+
+当 `Notification.create()` 完成后，通知需要通过两个通道交付给用户：
+1. **实时推送 (WebSocket)**：立即推送到在线用户的前端
+2. **邮件**：延迟发送给用户邮箱
+
+### 10.1 队列系统概览
+
+Outline 使用 **Bull** (Redis-backed) 队列系统，有 4 个主要队列：
+
+| 队列名称 | 用途 | 重试配置 | 特点 |
+|---------|------|---------|------|
+| `globalEvents` | 全局事件分发 | 5次尝试，指数退避 1s | 事件入口 |
+| `processorEvents` | 处理器事件 | 5次尝试，指数退避 10s | 事件处理 |
+| `websockets` | WebSocket 推送 | 10s 超时，无重试 | 尽力而为 |
+| `tasks` | 通用任务（邮件等） | 5次尝试，指数退避 10s | 幂等保护 |
+
+**队列配置**：`server/queues/queue.ts:10-67`
+```typescript
+export function createQueue(name: string, defaultJobOptions?) {
+  const queue = new Queue(name, {
+    createClient(type) {
+      switch (type) {
+        case "client": return Redis.defaultClient;
+        case "subscriber": return Redis.defaultSubscriber;
+        case "bclient": return new Redis(env.REDIS_URL, { /* 专用连接 */ });
+      }
+    },
+    defaultJobOptions: {
+      removeOnComplete: true,  // 完成后移除
+      removeOnFail: true,      // 失败后移除（可配置保留）
+      ...defaultJobOptions,
+    },
+  });
+}
+```
+
+**默认任务配置**：`server/queues/tasks/base/BaseTask.ts:48-61`
+```typescript
+public get options(): JobOptions {
+  return {
+    priority: TaskPriority.Normal,  // 20
+    attempts: 5,                     // 最多 5 次尝试
+    backoff: {
+      type: "exponential",           // 指数退避
+      delay: 60 * 1000,              // 初始延迟 60 秒
+    },
+  };
+}
+```
+
+---
+
+### 10.2 实时推送 (WebSocket) 通道
+
+#### 工作流程
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    WebSocket 实时推送流程                         │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  1. Notification 创建后触发 @AfterCreate 钩子                    │
+│     └─→ Notification.ts:199-222                                  │
+│                                                                 │
+│  2. Event.schedule() 调度 "notifications.create" 事件           │
+│     └─→ 进入 globalEventQueue                                    │
+│                                                                 │
+│  3. WebsocketsProcessor 处理事件                                 │
+│     └─→ websockets.ts:147-167                                   │
+│                                                                 │
+│  4. 推送到用户专属 channel                                       │
+│     └─→ WebsocketsProcessor.ts:650-659                         │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### 关键代码分析
+
+**步骤 1：通知创建后触发事件**
+
+`server/models/Notification.ts:199-222`
+```typescript
+@AfterCreate
+static async createEvent(model: Notification, options: SaveOptions) {
+  const params = {
+    name: "notifications.create",
+    userId: model.userId,      // 接收者用户 ID
+    modelId: model.id,         // 通知 ID
+    teamId: model.teamId,
+    commentId: model.commentId,
+    documentId: model.documentId,
+    actorId: model.actorId,    // 执行者 ID
+  };
+
+  // 事务提交后才调度
+  if (options.transaction) {
+    options.transaction.afterCommit(() => void Event.schedule(params));
+    return;
+  }
+  await Event.schedule(params);
+}
+```
+
+**步骤 2：事件调度**
+
+`server/models/Event.ts:142-150`
+```typescript
+static schedule(event: Partial<Event>) {
+  const now = new Date();
+  return globalEventQueue().add(
+    this.build({
+      createdAt: now,
+      ...event,
+    })
+  );
+}
+```
+
+**步骤 3：WebSocket 队列处理**
+
+`server/services/websockets.ts:145-167`
+```typescript
+const websockets = new WebsocketsProcessor();
+websocketQueue()
+  .process(
+    traceFunction({
+      serviceName: "websockets",
+      spanName: "process",
+      isRoot: true,
+    })(async function (job) {
+      const event = job.data;
+      Tracing.setResource(`Processor.WebsocketsProcessor`);
+      
+      // 注意：这里没有重试机制，失败只记录日志
+      websockets.perform(event, io).catch((error) => {
+        Logger.error("Error processing websocket event", error, { event });
+      });
+    })
+  )
+```
+
+**步骤 4：推送到用户 Channel**
+
+`server/queues/processors/WebsocketsProcessor.ts:650-659`
+```typescript
+case "notifications.create":
+case "notifications.update": {
+  const notification = await Notification.findByPk(event.modelId);
+  if (!notification) {
+    return;
+  }
+  
+  const data = await presentNotification(undefined, notification);
+  
+  // 推送到用户专属 channel: user-{userId}
+  return socketio.to(`user-${event.userId}`).emit(event.name, data);
+}
+```
+
+#### WebSocket Channel 机制
+
+用户连接时加入多个 channel：`server/services/websockets.ts:170-227`
+
+```typescript
+async function authenticated(io: IO.Server, socket: SocketWithAuth) {
+  const { user } = socket.client;
+  
+  // 基础 channels
+  const rooms = [
+    `team-${user.teamId}`,      // 团队广播
+    `user-${user.id}`,          // 个人专属 ⬅️ 通知使用这个
+  ];
+  
+  // 动态加入集合和群组 channels
+  const [collectionIds, groupIds] = await Promise.all([
+    user.collectionIds(),
+    user.groupIds(),
+  ]);
+  
+  collectionIds.forEach((colId) => rooms.push(`collection-${colId}`));
+  groupIds.forEach((groupId) => rooms.push(`group-${groupId}`));
+  
+  // 加入所有 channels
+  await socket.join(rooms);
+}
+```
+
+#### WebSocket 通道特点
+
+| 特性 | 实现方式 |
+|------|---------|
+| **重试机制** | ❌ 无重试，失败仅记录日志 |
+| **幂等性** | 依赖 `notification.id`，前端可去重 |
+| **补偿机制** | 用户刷新页面时通过 API 拉取通知列表 |
+| **实时性** | 在线用户立即收到 |
+
+---
+
+### 10.3 邮件通道
+
+#### 工作流程
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        邮件发送流程                               │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  1. EmailsProcessor 监听 "notifications.create" 事件            │
+│     └─→ EmailsProcessor.ts:17-212                              │
+│                                                                 │
+│  2. 根据事件类型选择邮件模板                                     │
+│     └─→ 例如: CommentMentionedEmail, CommentCreatedEmail        │
+│                                                                 │
+│  3. 调度 EmailTask (延迟 1 分钟)                                │
+│     └─→ BaseEmail.tsx:58-95                                    │
+│                                                                 │
+│  4. EmailTask.perform() 执行发送                                │
+│     └─→ EmailTask.ts:9-21                                      │
+│                                                                 │
+│  5. 发送前检查幂等条件                                          │
+│     └─→ BaseEmail.tsx:107-143                                  │
+│                                                                 │
+│  6. 发送成功后标记 emailedAt                                    │
+│     └─→ BaseEmail.tsx:191-198                                  │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### 关键代码分析
+
+**步骤 1：邮件处理器监听事件**
+
+`server/queues/processors/EmailsProcessor.ts:17-212`
+```typescript
+export default class EmailsProcessor extends BaseProcessor {
+  static applicableEvents: Event["name"][] = ["notifications.create"];
+
+  async perform(event: NotificationEvent) {
+    const notification = await Notification.scope([
+      "withTeam",
+      "withUser",
+      "withActor",
+    ]).findByPk(event.modelId);
+    
+    if (!notification) {
+      return;
+    }
+    
+    // 检查用户是否被暂停
+    if (notification.user.isSuspended) {
+      return;
+    }
+
+    // 根据通知类型选择邮件模板
+    switch (notification.event) {
+      case NotificationEventType.MentionedInComment: {
+        await new CommentMentionedEmail(
+          {
+            to: notification.user.email,
+            language: notification.user.language,
+            userId: notification.userId,
+            documentId: notification.documentId,
+            teamUrl: notification.team.url,
+            actorName: notification.actor.name,
+            commentId: notification.commentId,
+          },
+          { notificationId: notification.id }
+        ).schedule({
+          delay: Minute.ms,  // ⭐ 延迟 1 分钟发送
+        });
+        return;
+      }
+      
+      case NotificationEventType.CreateComment: {
+        await new CommentCreatedEmail(...).schedule({
+          delay: Minute.ms,  // 同样延迟 1 分钟
+        });
+        return;
+      }
+      // ... 其他事件类型
+    }
+  }
+}
+```
+
+**为什么延迟 1 分钟？** ⭐
+
+这是一个**智能抑制**设计：
+- 给用户时间在前端查看通知
+- 如果用户在这 1 分钟内点击查看，`viewedAt` 会被设置
+- 邮件实际发送时检查 `viewedAt`，避免发送已读邮件
+
+**步骤 2：邮件调度**
+
+`server/emails/templates/BaseEmail.tsx:58-95`
+```typescript
+public schedule(options?: Bull.JobOptions) {
+  // SMTP 未配置则跳过
+  if (!env.SMTP_FROM_EMAIL) {
+    Logger.info("email", `Email ${this.constructor.name} not sent due to missing SMTP config`);
+    return;
+  }
+
+  const templateName = this.constructor.name;
+  
+  // 调度到 taskQueue
+  return taskQueue().add(
+    {
+      name: "EmailTask",
+      props: {
+        templateName,
+        ...this.metadata,  // 包含 notificationId
+        props: this.props,
+      },
+    },
+    {
+      priority: TaskPriority.Normal,
+      attempts: 5,           // 最多 5 次重试
+      backoff: {
+        type: "exponential", // 指数退避
+        delay: 60 * 1000,    // 初始 60 秒
+      },
+      ...options,            // 可能包含 delay: Minute.ms
+    }
+  );
+}
+```
+
+**步骤 3：邮件任务执行**
+
+`server/queues/tasks/EmailTask.ts:9-21`
+```typescript
+export default class EmailTask extends BaseTask<Props> {
+  public async perform({ templateName, props, ...metadata }: Props) {
+    const EmailClass = emails[templateName];
+    if (!EmailClass) {
+      throw new Error(`Email task "${templateName}" template does not exist`);
+    }
+    
+    // 实例化并发送
+    const email = new EmailClass(props, metadata);
+    return email.send();
+  }
+}
+```
+
+**步骤 4：发送前幂等检查** ⭐
+
+`server/emails/templates/BaseEmail.tsx:107-143`
+```typescript
+public async send() {
+  const templateName = this.constructor.name;
+  const bsResponse = await this.beforeSend?.(this.props);
+  
+  if (bsResponse === false) {
+    Logger.info("email", `Email ${templateName} not sent due to beforeSend hook`);
+    return;
+  }
+
+  if (!this.props.to) {
+    Logger.info("email", `Email ${templateName} not sent due to missing email address`);
+    return;
+  }
+
+  // ⭐ 幂等检查 1：加载通知记录
+  const notification = this.metadata?.notificationId
+    ? await Notification.scope(["withActor", "withUser"]).findByPk(
+        this.metadata?.notificationId
+      )
+    : undefined;
+
+  // ⭐ 幂等检查 2：如果用户已在前端查看，不发送邮件
+  if (notification?.viewedAt) {
+    Logger.info(
+      "email",
+      `Email ${templateName} not sent as already viewed`,
+      this.props
+    );
+    return;  // 直接返回，不发送
+  }
+
+  // ⭐ 幂等检查 3：检查 emailedAt（隐式，发送后会设置）
+  // 如果 emailedAt 已设置，说明之前已发送成功
+  // 但由于任务完成后 removeOnComplete: true，这个检查主要靠其他机制
+  
+  // 发送邮件
+  try {
+    await mailer.sendMail({
+      to: this.props.to,
+      from: this.from(data),
+      subject,
+      messageId,        // 用于邮件线程
+      references,       // 用于邮件线程
+      // ... 其他参数
+    });
+    Metrics.increment("email.sent", { templateName });
+  } catch (err) {
+    Metrics.increment("email.sending_failed", { templateName });
+    throw err;  // 抛出错误触发重试
+  }
+
+  // ⭐ 幂等标记：发送成功后设置 emailedAt
+  if (notification) {
+    try {
+      notification.emailedAt = new Date();
+      await notification.save();
+    } catch (err) {
+      Logger.error(`Failed to update notification`, err, this.metadata);
+    }
+  }
+}
+```
+
+---
+
+### 10.4 重试机制详解
+
+#### Bull 队列的指数退避策略
+
+```
+任务重试时间线（假设所有尝试都失败）：
+
+T=0s     第 1 次尝试（立即执行）
+         ↓ 失败
+T=60s    第 2 次尝试 (delay = 60 * 2^0 = 60s)
+         ↓ 失败
+T=180s   第 3 次尝试 (delay = 60 * 2^1 = 120s 后，累计 180s)
+         ↓ 失败
+T=420s   第 4 次尝试 (delay = 60 * 2^2 = 240s 后，累计 420s)
+         ↓ 失败
+T=900s   第 5 次尝试 (delay = 60 * 2^3 = 480s 后，累计 900s = 15分钟)
+         ↓ 失败
+         任务放弃，记录失败日志
+```
+
+#### 重试触发条件
+
+任务抛出 `Error` 时触发重试：
+```typescript
+// BaseEmail.tsx:184-189
+try {
+  await mailer.sendMail({ /* ... */ });
+} catch (err) {
+  Metrics.increment("email.sending_failed", { templateName });
+  throw err;  // ⭐ 抛出错误，触发 Bull 重试机制
+}
+```
+
+#### 什么情况会触发重试？
+
+| 场景 | 是否重试 | 原因 |
+|------|---------|------|
+| SMTP 服务器连接超时 | ✅ 是 | `mailer.sendMail()` 抛出错误 |
+| 邮箱不存在（5xx 错误） | ❌ 否 | 通常配置为不重试永久错误 |
+| 邮件被临时拒绝（4xx） | ✅ 是 | 临时故障，可重试 |
+| 数据库查询失败 | ✅ 是 | 加载 Notification 时失败 |
+| 通知已被查看（viewedAt 已设置） | ❌ 否 | 幂等检查通过，正常返回 |
+| 通知已发送（emailedAt 已设置） | ❌ 否 | 幂等保护 |
+
+---
+
+### 10.5 幂等性保证机制
+
+邮件通道有**多层幂等保护**：
+
+#### 层面 1：发送前检查 `viewedAt`
+
+```typescript
+// BaseEmail.tsx:136-143
+if (notification?.viewedAt) {
+  Logger.info("email", `Email not sent as already viewed`);
+  return;  // 用户已在前端查看，不发送邮件
+}
+```
+
+**触发时机**：
+- 用户点击通知列表中的通知
+- 用户打开包含通知的页面
+- API `notifications.update` 被调用设置 `viewedAt`
+
+#### 层面 2：发送后设置 `emailedAt`
+
+```typescript
+// BaseEmail.tsx:191-198
+if (notification) {
+  try {
+    notification.emailedAt = new Date();
+    await notification.save();
+  } catch (err) {
+    Logger.error(`Failed to update notification`, err, this.metadata);
+  }
+}
+```
+
+**作用**：
+- 标记邮件已发送
+- 虽然 `removeOnComplete: true` 使任务不会重复执行
+- 但提供了审计追踪能力
+
+#### 层面 3：延迟发送 + viewedAt 检查
+
+这是最巧妙的设计：
+
+```
+时间线示例：
+
+T=0s:     用户 A 评论并提及用户 B
+          → Notification.create() 执行
+          → "notifications.create" 事件调度
+          → EmailsProcessor 调度 EmailTask，delay=60s
+
+T=10s:    用户 B 打开网页，看到通知并点击
+          → API: notifications.update (设置 viewedAt)
+
+T=60s:    EmailTask 执行
+          → 加载 Notification，发现 viewedAt 已设置
+          → 直接返回，不发送邮件
+          → 用户 B 不会收到"已读"邮件
+```
+
+---
+
+### 10.6 重复抑制机制
+
+除了幂等性，系统还有**主动抑制重复通知**的机制：
+
+#### 机制 1：文档更新通知的 6 小时窗口
+
+`server/queues/tasks/RevisionCreatedNotificationsTask.ts:180-233`
+```typescript
+private shouldNotify = async (document: Document, user: User) => {
+  // ⭐ 6 小时内已发送过邮件，则不重复发送
+  const notification = await Notification.findOne({
+    order: [["createdAt", "DESC"]],
+    where: {
+      userId: user.id,
+      documentId: document.id,
+      emailedAt: {
+        [Op.not]: null,
+        [Op.gte]: subHours(new Date(), 6),  // 过去 6 小时
+      },
+    },
+  });
+
+  if (notification) {
+    if (env.isDevelopment) {
+      // 开发环境不抑制，方便调试
+    } else {
+      Logger.info("processor", `suppressing notification to ${user.id} as recently notified`);
+      return false;  // 抑制通知
+    }
+  }
+
+  // 另外检查：用户是否已查看文档更新
+  const view = await View.findOne({
+    where: {
+      userId: user.id,
+      documentId: document.id,
+      updatedAt: { [Op.gt]: document.updatedAt },
+    },
+  });
+
+  if (view) {
+    return false;  // 已查看，抑制
+  }
+
+  return true;
+};
+```
+
+**为什么 6 小时？**
+- 避免同一文档频繁更新时轰炸用户邮箱
+- 用户收到一次邮件后，6 小时内的更新不再发邮件
+- 用户可通过前端实时推送查看更新
+
+#### 机制 2：评论通知的已查看抑制
+
+`server/models/helpers/NotificationHelper.ts:113-136`
+```typescript
+for (const recipient of recipients) {
+  // ... 其他检查
+  
+  // ⭐ 如果用户已查看文档（在评论创建后），不通知
+  const view = await View.findOne({
+    where: {
+      userId: recipient.id,
+      documentId: document.id,
+      updatedAt: {
+        [Op.gt]: comment.createdAt,  // 查看时间 > 评论创建时间
+      },
+    },
+  });
+
+  if (view) {
+    Logger.info(
+      "processor",
+      `suppressing notification to ${recipient.id} because doc viewed`
+    );
+    continue;  // 跳过此用户
+  }
+  // ...
+}
+```
+
+#### 机制 3：用户级别的去重
+
+在 `CommentCreatedNotificationsTask` 中：
+```typescript
+// 1. 追踪已提及的用户
+const userIdsMentioned: string[] = [];
+
+for (const mention of mentions) {
+  if (userIdsMentioned.includes(mention.modelId)) {
+    continue;  // 同一用户被多次提及，只通知一次
+  }
+  // 创建通知...
+  userIdsMentioned.push(recipient.id);
+}
+
+// 2. 订阅者通知排除已提及用户
+const recipients = (
+  await NotificationHelper.getCommentNotificationRecipients(...)
+).filter((recipient) => !userIdsMentioned.includes(recipient.id));
+```
+
+---
+
+### 10.7 完整端到端时序图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    完整端到端时序：评论创建 → 通知交付                        │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+  用户 A (评论者)                    后端系统                         用户 B (接收者)
+       │                                │                                    │
+       │  POST /comments.create        │                                    │
+       │───────────────────────────────>│                                    │
+       │                                │                                    │
+       │  1. 权限检查                   │                                    │
+       │  2. 创建 Comment 记录         │                                    │
+       │  3. 触发 comments.create 事件 │                                    │
+       │                                │                                    │
+       │<───────────────────────────────│                                    │
+       │     响应成功                    │                                    │
+       │                                │                                    │
+       │                                │                                    │
+       │              [异步处理开始]    │                                    │
+       │                                │                                    │
+       │              NotificationsProcessor                          │
+       │                                │                                    │
+       │              CommentCreatedNotificationsTask               │
+       │                                │                                    │
+       │         ┌──────────────────────┼──────────────────────┐             │
+       │         │                      │                      │             │
+       │         ▼                      ▼                      ▼             │
+       │  ┌─────────────┐      ┌─────────────┐      ┌─────────────┐       │
+       │  │ 用户提及处理 │      │ 群组提及处理 │      │ 订阅者处理  │       │
+       │  └──────┬──────┘      └──────┬──────┘      └──────┬──────┘       │
+       │         │                      │                      │             │
+       │         │                      ▼                      │             │
+       │         │           GroupMentionedInCommentTask      │             │
+       │         │           (独立异步任务，批量处理)         │             │
+       │         │                      │                      │             │
+       │         └──────────────────────┼──────────────────────┘             │
+       │                                │                                    │
+       │                                ▼                                    │
+       │              Notification.create() (为每个接收者)                   │
+       │                                │                                    │
+       │                                │                                    │
+       │         [通知交付通道：两条路径]  │                                    │
+       │                                │                                    │
+       │         ┌──────────────────────┴──────────────────────┐             │
+       │         │                                             │             │
+       │         ▼                                             ▼             │
+       │  ┌─────────────────┐                         ┌─────────────────┐    │
+       │  │ WebSocket 通道  │                         │   邮件通道      │    │
+       │  │   (实时推送)    │                         │   (延迟发送)    │    │
+       │  └────────┬────────┘                         └────────┬────────┘    │
+       │           │                                           │              │
+       │           │ @AfterCreate 钩子                        │              │
+       │           │ 触发 "notifications.create" 事件         │              │
+       │           │                                           │              │
+       │           ▼                                           │              │
+       │  ┌──────────────────┐                                 │              │
+       │  │ WebsocketsProcessor │                            │              │
+       │  └────────┬─────────┘                                 │              │
+       │           │                                           │              │
+       │           │ socketio.to(`user-${B.id}`)             │              │
+       │           │ .emit("notifications.create", data)     │              │
+       │           │                                           │              │
+       │           └───────────────────────────────────────────>│              │
+       │                                                        │              │
+       │                                                        │              │
+       │  [如果 B 在线，立即收到通知]                           │              │
+       │                                                        │              │
+       │           │                                           │              │
+       │           │                                           ▼              │
+       │           │                                ┌──────────────────┐     │
+       │           │                                │ EmailsProcessor  │     │
+       │           │                                └────────┬─────────┘     │
+       │           │                                         │               │
+       │           │                                         ▼               │
+       │           │                                ┌──────────────────┐     │
+       │           │                                │  选择邮件模板    │     │
+       │           │                                │  延迟 1 分钟调度 │     │
+       │           │                                └────────┬─────────┘     │
+       │           │                                         │               │
+       │           │                                         ▼               │
+       │           │                                ┌──────────────────┐     │
+       │           │                                │   EmailTask      │     │
+       │           │                                │  (taskQueue)     │     │
+       │           │                                └────────┬─────────┘     │
+       │           │                                         │               │
+       │           │                    1 分钟后...          │               │
+       │           │                                         │               │
+       │           │                                         ▼               │
+       │           │                                ┌──────────────────────┐│
+       │           │                                │  幂等检查：           ││
+       │           │                                │  1. viewedAt 已设置？ ││
+       │           │                                │  2. 用户是否暂停？    ││
+       │           │                                └──────────┬───────────┘│
+       │           │                                           │              │
+       │           │                          ┌────────────────┴────────────┐│
+       │           │                          │                             ││
+       │           │                    [已查看]                    [未查看] ││
+       │           │                          │                             ││
+       │           │                          ▼                             ▼│
+       │           │              ┌─────────────────┐          ┌─────────────────┐
+       │           │              │  不发送邮件     │          │  发送邮件       │
+       │           │              │  (智能抑制)     │          │  mailer.sendMail│
+       │           │              └─────────────────┘          └────────┬────────┘
+       │           │                                                         │
+       │           │                                                         ▼
+       │           │                                              ┌─────────────────┐
+       │           │                                              │ 设置 emailedAt  │
+       │           │                                              │  标记发送成功   │
+       │           │                                              └─────────────────┘
+       │           │                                                         │
+       │           │                                                         ▼
+       │           │                                            邮件送达用户 B 邮箱
+       │           │
+       │           │
+       │           │  [重试机制]
+       │           │
+       │           │  如果 mailer.sendMail() 抛出错误：
+       │           │  - 第 1 次失败 → 60s 后重试
+       │           │  - 第 2 次失败 → 120s 后重试 (累计 180s)
+       │           │  - 第 3 次失败 → 240s 后重试 (累计 420s)
+       │           │  - 第 4 次失败 → 480s 后重试 (累计 900s = 15分钟)
+       │           │  - 第 5 次失败 → 放弃，记录失败日志
+       │           │
+       │
+```
+
+---
+
+### 10.8 通道特性对比
+
+| 特性 | WebSocket 实时推送 | 邮件通道 |
+|------|-------------------|---------|
+| **实时性** | ✅ 在线用户立即收到 | ❌ 延迟 1 分钟 + 邮件传输时间 |
+| **重试机制** | ❌ 无重试，失败仅日志 | ✅ 5 次指数退避重试 |
+| **幂等性** | 依赖 `notification.id` 前端去重 | ✅ 多层幂等检查 |
+| **重复抑制** | 前端去重 | ✅ 智能抑制（viewedAt、6小时窗口等） |
+| **离线用户** | ❌ 离线收不到 | ✅ 邮件可送达 |
+| **持久化** | ❌ 无 | ✅ 记录 emailedAt |
+
+---
+
+### 10.9 关键代码位置索引（交付通道）
+
+| 功能模块 | 文件路径 | 关键函数/方法 |
+|---------|---------|--------------|
+| 队列创建 | `server/queues/queue.ts` | `createQueue()` |
+| 基础任务配置 | `server/queues/tasks/base/BaseTask.ts` | `get options()` |
+| WebSocket 推送 | `server/queues/processors/WebsocketsProcessor.ts` | `case "notifications.create"` |
+| WebSocket 服务 | `server/services/websockets.ts` | `authenticated()`, `websocketQueue().process()` |
+| 邮件处理器 | `server/queues/processors/EmailsProcessor.ts` | `perform()` |
+| 邮件基类 | `server/emails/templates/BaseEmail.tsx` | `schedule()`, `send()` |
+| 邮件任务 | `server/queues/tasks/EmailTask.ts` | `perform()` |
+| 6 小时抑制 | `server/queues/tasks/RevisionCreatedNotificationsTask.ts` | `shouldNotify()` |
+
+---
+
+## 11. 故障处理与监控
+
+### 11.1 任务失败处理
+
+**队列监控指标**：`server/queues/queue.ts:43-61`
+```typescript
+queue.on("stalled", () => {
+  Metrics.increment(`${prefix}.jobs.stalled`);
+});
+queue.on("completed", () => {
+  Metrics.increment(`${prefix}.jobs.completed`);
+});
+queue.on("error", () => {
+  Metrics.increment(`${prefix}.jobs.errored`);
+});
+queue.on("failed", () => {
+  Metrics.increment(`${prefix}.jobs.failed`);
+});
+
+// 定时采集队列长度
+if (env.ENVIRONMENT !== "test") {
+  setInterval(async () => {
+    Metrics.gauge(`${prefix}.count`, await queue.count());
+    Metrics.gauge(`${prefix}.delayed_count`, await queue.getDelayedCount());
+  }, 5 * Second.ms);
+}
+```
+
+### 11.2 邮件发送指标
+
+**`server/emails/templates/BaseEmail.tsx:181-189`**
+```typescript
+try {
+  await mailer.sendMail({ /* ... */ });
+  Metrics.increment("email.sent", { templateName });
+} catch (err) {
+  Metrics.increment("email.sending_failed", { templateName });
+  throw err;
+}
+```
+
+### 11.3 建议监控告警
+
+| 指标 | 告警阈值 | 说明 |
+|------|---------|------|
+| `queue.*.jobs.failed` | > 0 | 任务失败，需关注 |
+| `queue.*.count` | > 1000 | 队列积压，可能处理能力不足 |
+| `queue.*.delayed_count` | > 500 | 延迟任务过多 |
+| `email.sending_failed` | > 5% | 邮件发送失败率过高 |
+| `websockets.count` | 持续下降 | WebSocket 连接异常 |
+
+---
+
 *文档生成日期: 2026-05-05*
+*更新日期: 2026-05-05 (补充端到端时序与交付通道分析)*
