@@ -52,16 +52,38 @@ Outline 的邮件通知系统采用**事件驱动 + 异步队列**的架构设�
 
 ### 2.1 事件类型定义
 
-通知生成始于系统事件，Outline 支持多种事件类型，在 `NotificationEventType` 中定义：
+通知生成始于系统事件。Outline 有两层事件类型：
+
+### 2.1.1 Event.name（系统事件名） - 10 种
+
+这些是 `events` 表中存储的事件名称，由用户操作触发：
+
+| 事件名 | 触发场景 |
+|--------|----------|
+| `"documents.publish"` | 文档发布 |
+| `"documents.add_user"` | 向文档添加用户 |
+| `"documents.add_group"` | 向文档添加群组 |
+| `"revisions.create"` | 创建修订（文档更新） |
+| `"collections.create"` | 创建集合 |
+| `"collections.add_user"` | 向集合添加用户 |
+| `"comments.create"` | 创建评论 |
+| `"comments.update"` | 更新评论 |
+| `"comments.add_reaction"` | 添加评论反应 |
+| `"comments.remove_reaction"` | 移除评论反应 |
+
+> 注：`comments.add_reaction` 和 `comments.remove_reaction` 不会产生邮件通知。
+
+### 2.1.2 NotificationEventType（通知类型） - 11 种（实际会发送邮件）
+
+这些是 `notifications` 表中的 `event` 字段值，会由 `EmailsProcessor` 映射到具体邮件模板：
 
 ```typescript
-// 通知事件类型
+// 实际会发送邮件的通知类型（按 EmailsProcessor 实现）
 PublishDocument           // 文档发布
-UpdateDocument            // 文档更新
+UpdateDocument            // 文档更新 ⭐ 有 6 小时节流
 AddUserToDocument         // 添加用户到文档
 AddUserToCollection       // 添加用户到集合
 CreateComment             // 创建评论
-UpdateComment             // 更新评论
 ResolveComment            // 解决评论
 MentionedInDocument       // 文档中提及用户
 MentionedInComment        // 评论中提及用户
@@ -69,6 +91,22 @@ GroupMentionedInDocument  // 文档中提及群组
 GroupMentionedInComment   // 评论中提及群组
 CreateCollection          // 创建集合
 ```
+
+> ❌ **已删除**：`UpdateComment` 类型不存在，`comments.update` 事件实际产生的是 `MentionedInComment`、`GroupMentionedInComment` 和 `ResolveComment`
+
+### 2.1.3 完整事件类型映射表
+
+| Event.name | 路由到 Task | 产生的 NotificationEventType |
+|------------|-------------|------------------------------|
+| `"documents.publish"` | DocumentPublishedNotificationsTask | PublishDocument, MentionedInDocument, GroupMentionedInDocument |
+| `"documents.add_user"` | DocumentAddUserNotificationsTask | AddUserToDocument |
+| `"documents.add_group"` | DocumentAddGroupNotificationsTask | 转发给 AddUserNotificationsTask → AddUserToDocument |
+| `"revisions.create"` | RevisionCreatedNotificationsTask | UpdateDocument ⭐, MentionedInDocument, GroupMentionedInDocument |
+| `"revisions.create"` | ShareSubscriptionNotificationsTask | 分享订阅通知（独立）⭐ |
+| `"collections.create"` | CollectionCreatedNotificationsTask | CreateCollection |
+| `"collections.add_user"` | CollectionAddUserNotificationsTask | AddUserToCollection |
+| `"comments.create"` | CommentCreatedNotificationsTask | CreateComment, MentionedInComment, GroupMentionedInComment |
+| `"comments.update"` | CommentUpdatedNotificationsTask | MentionedInComment, GroupMentionedInComment, ResolveComment |
 
 ### 2.2 事件触发流程
 
