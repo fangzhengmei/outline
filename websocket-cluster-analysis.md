@@ -361,9 +361,435 @@ export class APIUpdateExtension implements Extension {
 4. **本地同步**：收到通知的实例检查文档是否在本地加载，如果是则从数据库获取最新状态并同步到 Y.js 文档
 5. **协作广播**：Y.js 更新自动通过 Hocuspocus Redis 扩展同步到其他实例的协作会话
 
-## 5. 消息路由流程图
+## 5. 关键分析：协作服务未配置专用 Redis 时的限制
 
-### 5.1 Socket.IO 事件广播流程
+### 5.1 代码实现分析
+
+**环境变量定义**（`server/env.ts:197-201`）：
+
+```typescript
+/**
+ * The url of redis for horizontally scaling the collaboration service. If not
+ * set then the collaboration service must be ran as a singleton.
+ */
+public REDIS_COLLABORATION_URL = environment.REDIS_COLLABORATION_URL;
+```
+
+**进程数量限制逻辑**（`server/index.ts:34-47`）：
+
+```typescript
+// The number of processes to run, defaults to the number of CPU's available
+// for the web service, and 1 for collaboration unless REDIS_COLLABORATION_URL is set.
+let webProcessCount = env.WEB_CONCURRENCY;
+
+if (env.SERVICES.includes("collaboration") && !env.REDIS_COLLABORATION_URL) {
+  if (webProcessCount !== 1) {
+    Logger.info(
+      "lifecycle",
+      "Note: Restricting process count to 1 due to use of collaborative service without REDIS_COLLABORATION_URL"
+    );
+  }
+
+  webProcessCount = 1;
+}
+```
+
+**Hocuspocus Redis 扩展条件加载**（`server/services/collaboration.ts:48-55`）：
+
+```typescript
+extensions: [
+  // Redis 扩展：实现跨实例协作同步
+  ...(env.REDIS_COLLABORATION_URL
+    ? [
+        new Redis({
+          redis: RedisAdapter.collaborationClient,
+        }),
+      ]
+    : []),
+  // ...
+]
+```
+
+### 5.2 多实例部署前提条件
+
+| 条件 | 要求 | 代码位置 |
+|------|------|----------|
+| 协作服务水平扩展 | 必须配置 `REDIS_COLLABORATION_URL` | `server/env.ts:198-199` |
+| 多进程/多实例运行 | 必须配置 `REDIS_COLLABORATION_URL` | `server/index.ts:38-46` |
+| 跨实例协作同步 | 必须配置 `REDIS_COLLABORATION_URL` | `server/services/collaboration.ts:49-55` |
+
+### 5.3 进程限制机制
+
+当未配置 `REDIS_COLLABORATION_URL` 且启用了协作服务时：
+
+1. **进程数强制设置为 1**（`server/index.ts:46`）
+   - 无论 `WEB_CONCURRENCY` 环境变量配置为何值
+   - 系统会输出日志提示：`"Note: Restricting process count to 1 due to use of collaborative service without REDIS_COLLABORATION_URL"`
+
+2. **Hocuspocus Redis 扩展不加载**（`server/services/collaboration.ts:49-55`）
+   - 扩展数组中不包含 `@hocuspocus/extension-redis`
+   - Y.js 文档状态仅存储在各实例内存中
+
+3. **协作状态隔离**
+   - 每个实例的协作文档状态独立
+   - 连接到不同实例的用户无法看到彼此的实时编辑
+
+### 5.4 未配置专用 Redis 时的部署限制
+
+**允许的部署方式**：
+- ✅ 单实例部署（1 个进程）
+- ✅ 单实例多进程（但进程数被强制限制为 1）
+
+**不允许/不推荐的部署方式**：
+- ❌ 多实例部署（负载均衡 + 多个 Node.js 实例）
+  - 原因：协作状态无法跨实例同步
+  - 后果：连接到不同实例的用户无法实时协作
+
+**架构对比**：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  场景 A：未配置 REDIS_COLLABORATION_URL（仅支持单实例）       │
+└─────────────────────────────────────────────────────────────┘
+
+                    ┌─────────────────┐
+                    │   Load Balancer │
+                    │   (无法使用)     │
+                    └────────┬────────┘
+                             │
+                    ┌────────▼────────┐
+                    │   Single Node   │
+                    │  (webProcess    │
+                    │    Count = 1)   │
+                    │                 │
+                    │  协作状态存储在  │
+                    │    内存中        │
+                    └─────────────────┘
+
+
+┌─────────────────────────────────────────────────────────────┐
+│  场景 B：配置了 REDIS_COLLABORATION_URL（支持多实例）          │
+└─────────────────────────────────────────────────────────────┘
+
+                    ┌─────────────────┐
+                    │   Load Balancer │
+                    └────────┬────────┘
+                             │
+            ┌────────────────┼────────────────┐
+            │                │                │
+      ┌─────▼─────┐    ┌─────▼─────┐    ┌─────▼─────┐
+      │  Instance A│    │  Instance B│    │  Instance C│
+      │            │    │            │    │            │
+      │ 协作状态通过 │    │ 协作状态通过 │    │ 协作状态通过 │
+      │ Redis 同步  │    │ Redis 同步  │    │ Redis 同步  │
+      └─────┬─────┘    └─────┬─────┘    └─────┬─────┘
+            │                │                │
+            └────────────────┼────────────────┘
+                             │
+                    ┌────────▼────────┐
+                    │  Redis (协作专用) │
+                    │ REDIS_COLLAB    │
+                    └─────────────────┘
+```
+
+## 6. 关键分析：HTTP 更新后发布订阅链路及断链条件
+
+### 6.1 链路组件分析
+
+**发布端**（`server/collaboration/APIUpdateExtension.ts:193-209`）：
+
+```typescript
+static async notifyUpdate(
+  documentId: string,
+  actorId: string
+): Promise<void> {
+  const channel = `${CHANNEL_PREFIX}:${documentId}`;
+  const message = JSON.stringify({
+    actorId,
+    timestamp: Date.now(),
+  });
+
+  // 关键：总是使用 defaultClient (REDIS_URL)
+  await RedisAdapter.defaultClient.publish(channel, message);
+}
+```
+
+**订阅端**（`server/collaboration/APIUpdateExtension.ts:53-61`）：
+
+```typescript
+this.subscriber = new RedisAdapter(
+  // 关键：优先使用 REDIS_COLLABORATION_URL，没有则使用 REDIS_URL
+  env.REDIS_COLLABORATION_URL || env.REDIS_URL,
+  {
+    connectionNameSuffix: "collab-api-updates",
+    maxRetriesPerRequest: null,
+  }
+);
+```
+
+**触发条件**（`server/models/Document.ts:585-599`）：
+
+```typescript
+@AfterUpdate
+static notifyCollaborationServer(model: Document, ctx: HookContext) {
+  // 当 state 字段变化且有认证用户时触发
+  if (model.changed("state") && ctx.auth?.user?.id) {
+    const actorId = ctx.auth.user.id;
+    const notify = async () => {
+      await APIUpdateExtension.notifyUpdate(model.id, actorId);
+    };
+
+    // 事务提交后执行
+    if (ctx.transaction) {
+      const transaction = ctx.transaction.parent || ctx.transaction;
+      transaction.afterCommit(notify);
+    } else {
+      void notify();
+    }
+  }
+}
+```
+
+### 6.2 发布订阅链路不对称性
+
+| 组件 | Redis 选择逻辑 | 使用的环境变量 |
+|------|----------------|----------------|
+| **发布端** (`notifyUpdate`) | 硬编码使用 `defaultClient` | `REDIS_URL` |
+| **订阅端** (`onConfigure`) | 优先使用协作 Redis | `REDIS_COLLABORATION_URL \|\| REDIS_URL` |
+| **协作同步** (Hocuspocus Redis) | 仅当配置协作 Redis 时启用 | `REDIS_COLLABORATION_URL` |
+
+### 6.3 场景分析
+
+#### 场景 1：仅配置 `REDIS_URL`（无 `REDIS_COLLABORATION_URL`）
+
+**配置**：
+- `REDIS_URL=redis://localhost:6379`
+- `REDIS_COLLABORATION_URL=`（未设置）
+
+**链路**：
+```
+HTTP 更新触发
+    │
+    ▼
+notifyUpdate() 使用 defaultClient (REDIS_URL)
+    │
+    ▼
+发布到 Redis (REDIS_URL) 的 collaboration:api-update:{docId} 频道
+    │
+    ▼
+订阅端使用 REDIS_COLLABORATION_URL || REDIS_URL → REDIS_URL
+    │
+    ▼
+同一 Redis 实例，消息正常接收
+```
+
+**状态**：✅ **链路正常**
+
+**限制**：此时协作服务被强制限制为单进程运行（见第 5 节）
+
+---
+
+#### 场景 2：配置 `REDIS_URL` 和 `REDIS_COLLABORATION_URL`（指向同一 Redis）
+
+**配置**：
+- `REDIS_URL=redis://localhost:6379`
+- `REDIS_COLLABORATION_URL=redis://localhost:6379`（同一实例）
+
+**链路**：
+```
+HTTP 更新触发
+    │
+    ▼
+notifyUpdate() 使用 defaultClient → REDIS_URL (同一实例)
+    │
+    ▼
+发布到 Redis 的 collaboration:api-update:{docId} 频道
+    │
+    ▼
+订阅端使用 REDIS_COLLABORATION_URL → 同一实例
+    │
+    ▼
+同一 Redis 实例，消息正常接收
+```
+
+**状态**：✅ **链路正常**
+
+---
+
+#### 场景 3：配置 `REDIS_URL` 和 `REDIS_COLLABORATION_URL`（指向不同 Redis）
+
+**配置**：
+- `REDIS_URL=redis://redis-a:6379`（Redis A）
+- `REDIS_COLLABORATION_URL=redis://redis-b:6379`（Redis B，不同实例）
+
+**链路**：
+```
+HTTP 更新触发
+    │
+    ▼
+notifyUpdate() 使用 defaultClient → REDIS_URL (Redis A)
+    │
+    ▼
+发布到 Redis A 的 collaboration:api-update:{docId} 频道
+    │
+    │  ⚠️ 断链点！发布和订阅在不同的 Redis 实例
+    │
+    ▼
+订阅端使用 REDIS_COLLABORATION_URL → Redis B
+    │
+    ▼
+Redis B 上没有收到消息（消息在 Redis A）
+    │
+    ▼
+协作会话无法收到 API 更新通知
+```
+
+**状态**：❌ **断链！**
+
+**影响**：
+- 通过 HTTP 接口更新的文档不会同步到正在进行的协作会话
+- 协作编辑的用户看不到 API 更新的内容
+- 持久化时可能产生冲突
+
+### 6.4 断链条件总结
+
+**断链发生的必要条件**（必须同时满足）：
+
+| 条件 | 说明 | 代码位置 |
+|------|------|----------|
+| 1. 配置了 `REDIS_COLLABORATION_URL` | 协作服务启用了专用 Redis | `server/services/collaboration.ts:49` |
+| 2. `REDIS_URL ≠ REDIS_COLLABORATION_URL` | 两个环境变量指向不同的 Redis 实例 | 部署配置 |
+| 3. 文档通过 HTTP 接口更新 | 触发 `state` 字段变化 | `server/models/Document.ts:587` |
+
+**断链发生位置**：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        断链示意图                                 │
+└─────────────────────────────────────────────────────────────────┘
+
+  HTTP API 更新
+       │
+       ▼
+┌──────────────┐
+│  Instance X  │
+│  (处理请求)   │
+└──────┬───────┘
+       │
+       ▼ notifyUpdate()
+       │ 使用 RedisAdapter.defaultClient
+       │
+       ▼
+┌──────────────────┐
+│   Redis A        │  ← REDIS_URL
+│                  │
+│  发布消息到频道：  │
+│  collaboration:  │
+│  api-update:doc1 │
+└──────────────────┘
+       │
+       │ ⚠️ 消息在这里 "消失" 了
+       │ 因为订阅在另一个 Redis
+       ▼
+┌──────────────────┐
+│   Redis B        │  ← REDIS_COLLABORATION_URL
+│                  │
+│  订阅频道：        │
+│  collaboration:  │
+│  api-update:*    │
+│                  │
+│  ❌ 没有收到消息  │
+└──────────────────┘
+       │
+       ▼
+┌──────────────┐    ┌──────────────┐
+│  Instance A  │    │  Instance B  │
+│  (协作服务)   │    │  (协作服务)   │
+│              │    │              │
+│  ❌ 无法同步  │    │  ❌ 无法同步  │
+└──────────────┘    └──────────────┘
+```
+
+### 6.5 完整消息路由流程图（含断链场景）
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  完整链路：HTTP 更新 → 协作会话同步（配置独立协作 Redis 时）            │
+└──────────────────────────────────────────────────────────────────────┘
+
+  REST API (PUT /documents/:id)
+            │
+            │ 更新文档 state 字段
+            ▼
+┌─────────────────────────────────────┐
+│  Document.notifyCollaborationServer │  ← server/models/Document.ts:585
+│  @AfterUpdate Hook                  │
+│  条件：changed("state") && auth.user │
+└───────────────────┬─────────────────┘
+                    │
+                    ▼ transaction.afterCommit()
+                    │
+┌─────────────────────────────────────┐
+│  APIUpdateExtension.notifyUpdate()  │  ← server/collaboration/APIUpdateExtension.ts:193
+│                                     │
+│  使用 RedisAdapter.defaultClient    │  ⚠️ 硬编码使用 REDIS_URL
+│  .publish(channel, message)         │
+└───────────────────┬─────────────────┘
+                    │
+                    ▼
+           ┌────────────────┐
+           │   Redis A      │  ← REDIS_URL
+           │                │
+           │  频道：         │
+           │  collaboration │
+           │  :api-update   │
+           │  :{documentId} │
+           └────────────────┘
+                    │
+                    │ ⚠️ 断链风险点
+                    │
+    ┌───────────────┴───────────────┐
+    │                               │
+    ▼ 配置相同 Redis                 ▼ 配置不同 Redis
+┌──────────────┐              ┌──────────────┐
+│ Redis A ==   │              │ Redis A !=   │
+│ Redis B      │              │ Redis B      │
+│ (同一实例)    │              │ (不同实例)    │
+└──────┬───────┘              └──────┬───────┘
+       │                             │
+       ▼ 正常                        ▼ 断链
+┌─────────────────────────┐    ┌─────────────────────────┐
+│  订阅端使用              │    │  订阅端使用              │
+│  REDIS_COLLABORATION_URL│    │  REDIS_COLLABORATION_URL│
+│  = Redis A               │    │  = Redis B               │
+│                         │    │                         │
+│  ✅ 收到消息             │    │  ❌ 收不到消息           │
+│  (同一实例)              │    │  (不同实例)              │
+└──────────┬──────────────┘    └─────────────────────────┘
+           │
+           ▼
+┌─────────────────────────┐
+│  APIUpdateExtension     │
+│  .handleMessage()       │
+│                         │
+│  从 DB 读取最新 state    │
+│  计算 Y.js 增量更新      │
+│  applyUpdate 到协作文档  │
+└──────────┬──────────────┘
+           │
+           ▼ (如果配置了 Hocuspocus Redis 扩展)
+┌─────────────────────────┐
+│  @hocuspocus/           │
+│  extension-redis        │
+│                         │
+│  通过 Redis 同步到其他   │
+│  实例的协作会话          │
+└─────────────────────────┘
+```
+
+## 7. 消息路由流程图
+
+### 7.1 Socket.IO 事件广播流程
 
 ```
 ┌──────────────┐
@@ -412,7 +838,7 @@ export class APIUpdateExtension implements Extension {
                    └──────────┘  └──────────┘
 ```
 
-### 5.2 协作编辑同步流程
+### 7.2 协作编辑同步流程
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -453,9 +879,9 @@ Instance A  Instance B  Instance C
   广播到本地客户端      广播到本地客户端
 ```
 
-## 6. 关键技术点分析
+## 8. 关键技术点分析
 
-### 6.1 Socket.IO Redis 适配器工作原理
+### 8.1 Socket.IO Redis 适配器工作原理
 
 `socket.io-redis` 适配器的工作机制：
 
@@ -467,7 +893,7 @@ Instance A  Instance B  Instance C
 
 3. **自定义事件**：支持跨实例的自定义事件通信
 
-### 6.2 连接升级处理
+### 8.2 连接升级处理
 
 Outline 支持两种 WebSocket 服务在同一端口运行，通过路径区分：
 
@@ -495,7 +921,7 @@ server.on(
 );
 ```
 
-### 6.3 认证与授权
+### 8.3 认证与授权
 
 WebSocket 连接的认证流程：
 
@@ -521,17 +947,48 @@ async function authenticate(socket: SocketWithAuth) {
 }
 ```
 
-## 7. 部署与配置建议
+## 9. 部署与配置建议
 
-### 7.1 环境变量配置
+### 9.1 环境变量配置
 
 | 环境变量 | 用途 | 说明 |
 |----------|------|------|
-| `REDIS_URL` | 默认 Redis 连接 | 用于 Socket.IO 适配器、队列、缓存等 |
-| `REDIS_COLLABORATION_URL` | 协作服务专用 Redis | 可选，配置后协作服务使用独立 Redis 实例 |
-| `URL` | 服务 URL | 用于 CORS 和 Origin 验证 |
+| `REDIS_URL` | 默认 Redis 连接 | 用于 Socket.IO 适配器、队列、缓存、API 更新发布 |
+| `REDIS_COLLABORATION_URL` | 协作服务专用 Redis | 可选，配置后用于协作同步和 API 更新订阅 |
+| `WEB_CONCURRENCY` | 进程数量 | 未配置协作 Redis 时被强制设置为 1 |
+| `SERVICES` | 启用的服务列表 | 包含 `collaboration` 时启用协作服务 |
 
-### 7.2 多实例部署最佳实践
+### 9.2 配置最佳实践
+
+**推荐配置方式**：
+
+1. **方式 A：单 Redis 实例（简单部署）**
+   ```bash
+   REDIS_URL=redis://redis:6379
+   # REDIS_COLLABORATION_URL 不设置
+   ```
+   - 协作服务被限制为单进程
+   - API 更新链路正常
+   - 适合小型部署
+
+2. **方式 B：单 Redis 实例 + 多进程协作**
+   ```bash
+   REDIS_URL=redis://redis:6379
+   REDIS_COLLABORATION_URL=redis://redis:6379  # 同一 URL
+   ```
+   - 协作服务支持多进程/多实例
+   - API 更新链路正常（同一 Redis）
+   - ✅ **推荐配置**
+
+3. **方式 C：双 Redis 实例（隔离部署）⚠️ 需注意**
+   ```bash
+   REDIS_URL=redis://redis-default:6379
+   REDIS_COLLABORATION_URL=redis://redis-collab:6379  # 不同实例
+   ```
+   - ⚠️ **API 更新链路断链**（发布在 default，订阅在 collab）
+   - 需要修复代码中的不对称问题
+
+### 9.3 多实例部署最佳实践
 
 1. **负载均衡配置**：
    - 启用 WebSocket 支持（Upgrade 头处理）
@@ -539,15 +996,21 @@ async function authenticate(socket: SocketWithAuth) {
 
 2. **Redis 配置**：
    - 使用 Redis Cluster 或 Sentinel 确保高可用
-   - 考虑为协作服务使用独立的 Redis 实例（通过 `REDIS_COLLABORATION_URL`）
+   - **强烈建议**：`REDIS_URL` 和 `REDIS_COLLABORATION_URL` 配置为同一 Redis 实例，或修复代码中的不对称性
    - 配置合理的连接池大小
 
-3. **监控与日志**：
+3. **协作服务扩展前提**：
+   - 必须配置 `REDIS_COLLABORATION_URL`
+   - 确保该 Redis 实例可被所有协作服务实例访问
+   - 如果配置了独立协作 Redis，需注意 API 更新链路问题
+
+4. **监控与日志**：
    - 监控 WebSocket 连接数（`websockets.count` 指标）
    - 监控 Redis pub/sub 消息延迟
    - 关注 `socket.io#` 前缀的 Redis 频道消息量
+   - 监控 `collaboration:api-update:*` 频道的消息发布/订阅情况
 
-### 7.3 故障恢复
+### 9.4 故障恢复
 
 1. **Redis 连接故障**：
    - 适配器会自动重试连接（可配置 `maxRetriesPerRequest`）
@@ -557,7 +1020,14 @@ async function authenticate(socket: SocketWithAuth) {
    - 连接到故障实例的客户端会自动重连到其他实例
    - Socket.IO 适配器确保消息能够到达存活实例上的客户端
 
-## 8. 总结
+3. **API 更新断链恢复**：
+   - 如果配置了双 Redis 且发现断链：
+     - 临时方案：将 `REDIS_COLLABORATION_URL` 改为与 `REDIS_URL` 相同
+     - 长期方案：修复代码中的发布/订阅不对称性
+
+## 10. 总结
+
+### 10.1 核心架构
 
 Outline 的多实例 WebSocket 集群实现采用了成熟的技术方案：
 
@@ -566,9 +1036,28 @@ Outline 的多实例 WebSocket 集群实现采用了成熟的技术方案：
 3. **自定义 Redis pub/sub**：实现 API 更新到协作会话的同步
 4. **多 Redis 客户端分离**：发布、订阅、协作使用独立连接，避免阻塞
 
-这种架构确保了 Outline 在多实例部署场景下的实时性、可靠性和可扩展性，是一个设计良好的分布式实时通信系统实现。
+### 10.2 关键发现
 
-## 9. 参考代码位置
+**发现 1：协作服务多实例部署的强制条件**
+- 未配置 `REDIS_COLLABORATION_URL` 时，协作服务被强制限制为单进程运行
+- 原因：Hocuspocus Redis 扩展只在配置了协作 Redis 时才加载
+- 影响：多实例部署时协作状态无法同步
+
+**发现 2：API 更新发布订阅链路的不对称性**
+- 发布端（`notifyUpdate`）硬编码使用 `REDIS_URL`
+- 订阅端优先使用 `REDIS_COLLABORATION_URL`
+- 当配置两个不同的 Redis 实例时，链路断链
+- 影响：HTTP 更新无法同步到协作会话
+
+### 10.3 部署建议
+
+| 部署场景 | 推荐配置 | 注意事项 |
+|----------|----------|----------|
+| 单实例小型部署 | 不配置 `REDIS_COLLABORATION_URL` | 协作服务单进程 |
+| 多实例标准部署 | `REDIS_URL` = `REDIS_COLLABORATION_URL` | ✅ 推荐，链路正常 |
+| 双 Redis 隔离部署 | 需修复代码不对称性 | ⚠️ 当前实现存在断链风险 |
+
+## 11. 参考代码位置
 
 | 功能 | 文件路径 | 行号 |
 |------|----------|------|
@@ -576,6 +1065,12 @@ Outline 的多实例 WebSocket 集群实现采用了成熟的技术方案：
 | Redis 适配器配置 | `server/services/websockets.ts` | 95-100 |
 | Redis 客户端管理 | `server/storage/redis.ts` | 1-163 |
 | 协作服务配置 | `server/services/collaboration.ts` | 1-143 |
-| API 更新同步 | `server/collaboration/APIUpdateExtension.ts` | 1-210 |
+| API 更新同步扩展 | `server/collaboration/APIUpdateExtension.ts` | 1-210 |
+| API 更新发布（硬编码 defaultClient） | `server/collaboration/APIUpdateExtension.ts` | 193-209 |
+| API 更新订阅（优先协作 Redis） | `server/collaboration/APIUpdateExtension.ts` | 53-61 |
+| 进程数量限制逻辑 | `server/index.ts` | 34-47 |
+| 协作 Redis 扩展条件加载 | `server/services/collaboration.ts` | 48-55 |
+| 文档更新触发通知 | `server/models/Document.ts` | 585-599 |
 | WebSocket 事件处理器 | `server/queues/processors/WebsocketsProcessor.ts` | 1-1031 |
 | 房间管理逻辑 | `server/services/websockets.ts` | 170-227 |
+| 环境变量定义（协作 Redis 注释） | `server/env.ts` | 197-201 |
